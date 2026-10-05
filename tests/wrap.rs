@@ -822,3 +822,33 @@ fn a_forever_writer_behind_a_slow_reader_is_still_capped() {
     assert!(t0.elapsed() < Duration::from_secs(9), "{:?}", t0.elapsed());
     assert!(st.success() || st.signal().is_some(), "{st:?}");
 }
+
+#[test]
+fn a_late_reader_gets_everything_an_exited_child_left() {
+    // The child writes ~700 KB and exits; the reader only starts after 5 s
+    // (`cmd | less` nobody has scrolled yet). Nothing is left writing, so the
+    // drain cap must not apply: every byte arrives.
+    use std::io::Read;
+    let e = Env::new();
+    let mut c = e.cmd();
+    c.args([
+        "--no-s1",
+        "-q",
+        "--pipe",
+        "--silence",
+        "0",
+        "--",
+        "head",
+        "-c",
+        "700000",
+        "/dev/zero",
+    ])
+    .stdout(std::process::Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    let mut out = child.stdout.take().unwrap();
+    std::thread::sleep(Duration::from_secs(5));
+    let mut all = Vec::new();
+    out.read_to_end(&mut all).unwrap();
+    assert!(child.wait().unwrap().success());
+    assert_eq!(all.len(), 700_000, "output lost");
+}
