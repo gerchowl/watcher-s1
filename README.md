@@ -72,6 +72,7 @@ Or ad hoc: `nix run github:gerchowl/watcher-s1 -- -- make test`, or
 ```text
 watcher-s1 [OPTIONS] -- CMD [ARGS...]
 watcher-s1 config [--s1-url URL] [--s1-timeout SECS] [--config FILE]
+watcher-s1 judge --posttooluse [--s1-url URL] ...   # Claude Code hook, see below
 ```
 
 | Option | Default | Meaning |
