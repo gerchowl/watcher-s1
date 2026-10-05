@@ -277,15 +277,20 @@ which has already run anyway.
 
 This repo uses [vig-os/devkit](https://github.com/vig-os/devkit) (direnv mode,
 trunk workflow, solo profile with `scanning` kept because the repo is public).
-`direnv allow` (or `nix develop`) gives the pinned Rust toolchain and the
-pre-commit hooks, including `cargo fmt --check` and
-`cargo clippy -D warnings`.
+`direnv allow` (or `nix develop`) gives the Rust toolchain pinned by
+`rust-toolchain.toml` and the pre-commit hooks, including `cargo fmt --check`
+and `cargo clippy -D warnings`. The flake uses devkit's Rust pack
+(`vigos.lib.mkRustProject`): `checks` (clippy, fmt, nextest, doctest, doc)
+and the `cargo auditable` package come from it. The dev shell is
+`mkProjectShell` fed the same toolchain, because the pack's own dev shell does
+not forward the `.vig-os` hook settings yet (vig-os/devkit#1810).
 
 ```bash
 just lint       # rustfmt check + clippy -D warnings
 just test       # cargo test --locked: unit + integration (fake System One server)
 just precommit  # every hook, as CI runs them
 just nix-build  # the flake package
+just flake-check  # the Rust pack's checks, nextest included, in the Nix sandbox
 just test-kev url=http://…/v1/systemone   # opt-in real System One checks, sequential
 ```
 
