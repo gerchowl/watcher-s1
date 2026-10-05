@@ -289,7 +289,9 @@ just nix-build  # the flake package
 just test-kev url=http://…/v1/systemone   # opt-in real System One checks, sequential
 ```
 
-The real-endpoint tests (`tests/kev.rs`) only run when `SYSTEMONE_URL` is set,
+The real-endpoint tests (`tests/kev.rs`) only run when the test-only
+`WATCHER_S1_KEV_URL` is set (`just test-kev` sets it; a host-wide
+`SYSTEMONE_URL` does not trigger them),
 and they make their calls strictly one after another. The host is wedge-prone, so
 never parallelise them.
 

@@ -1,8 +1,8 @@
-//! Real System One (Kev) checks. Opt-in: they run only when SYSTEMONE_URL
-//! is set, e.g.
+//! Real System One (Kev) checks. Opt-in: they run only when the test-only
+//! WATCHER_S1_KEV_URL is set (deliberately NOT the shared SYSTEMONE_URL,
+//! which fleet hosts export for everyday use), e.g.
 //!
-//!   SYSTEMONE_URL=http://sage.tail22bd7c.ts.net:8023/v1/systemone \
-//!     cargo test --test kev -- --nocapture
+//!   just test-kev url=http://<kev-host>:8023/v1/systemone
 //!
 //! Everything lives in ONE test so the calls are strictly sequential: the
 //! Kev host is wedge-prone and must never see a burst. No endpoint is
@@ -16,8 +16,8 @@ use std::process::Stdio;
 
 #[test]
 fn real_system_one_sequential() {
-    let Some(url) = std::env::var("SYSTEMONE_URL").ok().filter(|u| !u.is_empty()) else {
-        eprintln!("SYSTEMONE_URL unset: skipping the real System One checks");
+    let Some(url) = std::env::var("WATCHER_S1_KEV_URL").ok().filter(|u| !u.is_empty()) else {
+        eprintln!("WATCHER_S1_KEV_URL unset: skipping the real System One checks");
         return;
     };
     // A tail that ENDS in an error: the measured fused score clears 0.8.
