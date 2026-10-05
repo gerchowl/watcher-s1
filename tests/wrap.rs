@@ -466,9 +466,13 @@ fn helper_vfork_hold() {
     else {
         return;
     };
-    #[allow(deprecated)]
+    // Declared here: the libc crate does not export vfork on darwin, but
+    // both libcs still provide it.
+    unsafe extern "C" {
+        fn vfork() -> libc::pid_t;
+    }
     unsafe {
-        if libc::vfork() == 0 {
+        if vfork() == 0 {
             // Only async-signal-safe syscalls in a vfork child.
             libc::sleep(secs);
             libc::_exit(0);
