@@ -115,6 +115,37 @@ pub fn alive(pid: i32) -> bool {
     }
 }
 
+/// Answers to every built-in question, consistent with one "how failing"
+/// level: the failure-type questions answer `failing`, the success-type
+/// ones `clean_done`, and the `outcome` choice splits accordingly.
+pub fn answers_json(failing: f64, clean_done: f64) -> Value {
+    let n = |p: f64| serde_json::json!({"type": "noul", "noul": p});
+    serde_json::json!({
+        "failing": n(failing),
+        "clean_done": n(clean_done),
+        "red": n(failing),
+        "any_failure": n(failing),
+        "exit_status": n(failing),
+        "tests_failed": n(failing),
+        "ends_with_error": n(failing),
+        "succeeded": n(clean_done),
+        "error_present": n(failing),
+        "outcome": {"type": "choice", "probabilities": {
+            "success": clean_done * 0.9,
+            "failure": failing * 0.7,
+            "partial": failing * 0.3,
+            "info": (1.0 - clean_done * 0.9 - failing).max(0.0)
+        }}
+    })
+}
+
+/// The built-in score for `answers_json(failing, clean_done)`.
+pub fn builtin_score(failing: f64, clean_done: f64) -> f64 {
+    let set = watcher_s1::questions::QuestionSet::builtin();
+    set.fuse(answers_json(failing, clean_done).as_object().unwrap())
+        .unwrap()
+}
+
 /// What the fake server does with each request.
 #[derive(Clone)]
 pub enum Reply {
@@ -162,10 +193,7 @@ impl FakeS1 {
                         Reply::Answers { failing, clean_done } => {
                             let j = serde_json::json!({
                                 "model": "fake",
-                                "answers": {
-                                    "failing": {"type": "noul", "noul": failing},
-                                    "clean_done": {"type": "noul", "noul": clean_done}
-                                },
+                                "answers": answers_json(failing, clean_done),
                                 "usage": {"input_tokens": 1, "output_tokens": 1},
                                 "latency_ms": 1.0
                             })

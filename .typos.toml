@@ -5,6 +5,8 @@
 # https://github.com/crate-ci/typos
 
 [default.extend-words]
+# Eval metrics: false-positive rate (docs/eval, eval/score.py)
+FPR = "FPR"
 # Shell scripting: sed label syntax uses 'ba' (branch to label 'a')
 ba = "ba"
 # CVE policy term (#637): a finding "unexcepted" = not in the exception register

@@ -1,0 +1,66 @@
+# Candidate System One questions for the [fleet-config-repo]#244 follow-up spike.
+# All are sent in ONE request per state; eval/score.py fits and compares
+# single questions and fusions. The winners are copied to
+# questions/builtin.toml.
+
+[questions.failing]
+type = "noul"
+instructions = "Does the output show an error that the process did not recover from?"
+criteria.true = "an error, crash, failed step or failed test that is not followed by a successful retry"
+criteria.false = "no errors, or only warnings, expected test noise, or errors that were retried successfully"
+
+[questions.clean_done]
+type = "noul"
+instructions = "Did the process reach a clean, successful end?"
+criteria.true = "the output ends with the work completed and nothing left broken"
+criteria.false = "the output ends mid-work, or with something broken or unfinished"
+
+[questions.red]
+type = "noul"
+instructions = "Did the command in this output fail?"
+criteria.true = "the output shows the command failed: failing tests, a compile error, a non-zero exit, or an error that stopped it"
+criteria.false = "the output shows the command completed successfully with no failures"
+
+[questions.any_failure]
+type = "noul"
+instructions = "Does the output report any failure at all?"
+criteria.true = "at least one command, step, check, assertion or test failed or errored, even if the run continued to the end or printed a summary"
+criteria.false = "nothing failed: every step, check and test that ran succeeded"
+
+[questions.exit_status]
+type = "noul"
+instructions = "Would this command most likely exit with a non-zero status?"
+criteria.true = "yes: the output shows an error or a failure, so the command ends with an error status"
+criteria.false = "no: the output shows success or ordinary output, so the command exits with status 0"
+
+[questions.tests_failed]
+type = "noul"
+instructions = "Did any test fail?"
+criteria.true = "one or more tests failed or errored, for example 'N failed', 'FAILED' or 'test result: FAILED'"
+criteria.false = "no tests failed, or no tests ran"
+
+[questions.ends_with_error]
+type = "noul"
+instructions = "Does the output end with an error message?"
+criteria.true = "the last lines report an error, a failure or an abort"
+criteria.false = "the last lines report success, progress or ordinary output"
+
+[questions.succeeded]
+type = "noul"
+instructions = "Did the command succeed?"
+criteria.true = "the output shows the command did what it was asked and nothing failed"
+criteria.false = "something failed, errored, was refused or was not found"
+
+[questions.error_present]
+type = "noul"
+instructions = "Does the output contain an error message?"
+criteria.true = "there is an error, exception, traceback or failure message anywhere in it"
+criteria.false = "there are no error or failure messages"
+
+[questions.outcome]
+type = "choice"
+instructions = "How did this command end?"
+criteria.success = "it finished and everything it did worked"
+criteria.failure = "it failed, errored, or reported failures"
+criteria.partial = "it finished, but some parts failed"
+criteria.info = "it only printed information; there was nothing that could succeed or fail"
