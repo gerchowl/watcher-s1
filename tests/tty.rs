@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 
 struct Term {
     master: std::fs::File,
-    slave: OwnedFd,
+    /// Held so the terminal outlives the watcher on Linux.
+    _slave: OwnedFd,
     screen: Arc<Mutex<Vec<u8>>>,
     child: Child,
 }
@@ -59,7 +60,7 @@ impl Term {
         });
         Term {
             master,
-            slave: pty.slave,
+            _slave: pty.slave,
             screen,
             child,
         }
@@ -98,10 +99,6 @@ impl Term {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-    }
-
-    fn termios(&self) -> nix::sys::termios::Termios {
-        nix::sys::termios::tcgetattr(&self.slave).unwrap()
     }
 }
 
@@ -150,15 +147,18 @@ fn sigterm_works_while_waiting_for_input() {
 
 #[test]
 fn terminal_modes_are_restored() {
-    use nix::sys::termios::LocalFlags;
+    // Compare `stty -g` from inside the session: on darwin the terminal is
+    // revoked once the session leader exits, so the test cannot ask later.
     let e = Env::new();
-    let mut t = Term::spawn(&e, &["--no-s1", "-q", "--", "sh", "-c", "sleep .3"]);
-    let before = t.termios();
+    let script = format!(
+        "a=$(stty -g); {BIN} --no-s1 -q --events {ev} -- sh -c 'sleep .3'; b=$(stty -g); [ \"$a\" = \"$b\" ] && echo MODES-SAME || echo MODES-DIFF",
+        ev = e.path("events.jsonl").display()
+    );
+    let mut c = Command::new("sh");
+    c.arg("-c").arg(script);
+    let mut t = Term::spawn_cmd(&e, c);
     t.wait(Duration::from_secs(5));
-    let after = t.termios();
-    assert!(after.local_flags.contains(LocalFlags::ICANON | LocalFlags::ECHO));
-    assert_eq!(before.local_flags, after.local_flags);
-    assert_eq!(before.output_flags, after.output_flags);
+    assert!(t.wait_for("MODES-SAME", Duration::from_secs(1)), "{:?}", t.screen());
 }
 
 /// A shell (session leader on the PTY) runs the watcher with --pipe, then
