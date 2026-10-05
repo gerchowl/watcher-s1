@@ -147,11 +147,15 @@ fn sigterm_works_while_waiting_for_input() {
 
 #[test]
 fn terminal_modes_are_restored() {
-    // Compare `stty -g` from inside the session: on darwin the terminal is
-    // revoked once the session leader exits, so the test cannot ask later.
+    // Compare the modes from inside the session: on darwin the terminal is
+    // revoked once its session leader exits, so the test cannot ask later.
+    // `pendin` is ignored: XNU sets it whenever a tty returns to canonical
+    // mode (after any raw-mode program) and clears it on the next read.
     let e = Env::new();
+    let modes = "stty -a | tr ' ;' '\\n\\n' | grep -v pendin | grep . | sort | tr '\\n' ' '";
     let script = format!(
-        "a=$(stty -g); {BIN} --no-s1 -q --events {ev} -- sh -c 'sleep .3'; b=$(stty -g); [ \"$a\" = \"$b\" ] && echo MODES-SAME || echo MODES-DIFF",
+        "a=$({modes}); {BIN} --no-s1 -q --events {ev} -- sh -c 'sleep .3'; b=$({modes}); \
+         if [ \"$a\" = \"$b\" ]; then echo MODES-SAME; else echo \"MODES-DIFF before=[$a] after=[$b]\"; fi",
         ev = e.path("events.jsonl").display()
     );
     let mut c = Command::new("sh");
