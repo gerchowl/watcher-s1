@@ -524,3 +524,35 @@ fn a_hung_tls_handshake_respects_the_deadline() {
     assert!(r.elapsed < Duration::from_secs(3), "{:?}", r.elapsed);
     assert_eq!(last(&e.events())["s1"], Value::Null);
 }
+
+#[test]
+fn a_dripping_tls_server_cannot_stretch_the_deadline() {
+    // A valid TLS record header announcing 16 KiB, then one byte every
+    // 0.5 s: each socket read succeeds, so only a per-read deadline helps.
+    use std::io::Write;
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("https://localhost:{}/v1/systemone", l.local_addr().unwrap().port());
+    std::thread::spawn(move || {
+        for mut s in l.incoming().flatten() {
+            std::thread::spawn(move || {
+                let _ = s.write_all(&[0x16, 0x03, 0x03, 0x40, 0x00]);
+                for _ in 0..200 {
+                    std::thread::sleep(Duration::from_millis(500));
+                    if s.write_all(&[0x02]).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let e = Env::new();
+    let r = run({
+        let mut c = e.cmd();
+        c.args(["-q", "--silence", "0", "--s1-url", &url, "--s1-timeout", "1", "--"])
+            .args(["sh", "-c", "echo 'error: x'; exit 1"]);
+        c
+    });
+    assert_eq!(r.status.code(), Some(1));
+    assert!(r.elapsed < Duration::from_secs(3), "deadline overrun: {:?}", r.elapsed);
+    assert_eq!(last(&e.events())["s1"], Value::Null);
+}
