@@ -628,6 +628,36 @@ impl Tee {
         }
     }
 
+    /// The drain-time send: before the exit just `try_send`; after it, wait
+    /// for room until `cap` (processes may still be writing), or with no cap
+    /// for as long as it takes, unless a stop signal arrives.
+    fn send_draining(
+        &self,
+        chunk: (RawFd, Vec<u8>),
+        draining: bool,
+        cap: Option<Instant>,
+        sig_r: RawFd,
+    ) -> Result<(), Stop> {
+        if !draining {
+            return self.try_send(chunk).map_err(Stop::Full);
+        }
+        if let Some(cap) = cap {
+            return self.send_until(chunk, cap).map_err(Stop::Full);
+        }
+        let mut chunk = chunk;
+        loop {
+            match self.try_send(chunk) {
+                Ok(()) => return Ok(()),
+                Err(back) => {
+                    chunk = back;
+                    if stop_signalled(sig_r, 20) {
+                        return Err(Stop::Signal);
+                    }
+                }
+            }
+        }
+    }
+
     /// Queue, waiting for room until `deadline`; past it the chunk comes back.
     fn send_until(&self, mut chunk: (RawFd, Vec<u8>), deadline: Instant) -> Result<(), (RawFd, Vec<u8>)> {
         loop {
@@ -645,29 +675,51 @@ impl Tee {
     /// Flush everything queued, like a process blocking on its last write,
     /// but give up when INT/TERM/HUP/QUIT arrives on the signal pipe: being
     /// told to stop beats delivering the rest to a reader that is not reading.
+    /// (We still exit like the child did: the signal stopped the tee, not the
+    /// child.)
     fn finish(self, sig_r: RawFd) {
         drop(self.tx);
-        let mut sb = [0u8; 64];
         while !self.handle.is_finished() {
-            let mut p = libc::pollfd {
-                fd: sig_r,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            unsafe { libc::poll(&mut p, 1, 20) };
-            while let Some(n) = read_some(sig_r, &mut sb).filter(|n| *n > 0) {
-                if sb[..n].iter().any(|&s| {
-                    matches!(
-                        s as libc::c_int,
-                        libc::SIGINT | libc::SIGTERM | libc::SIGHUP | libc::SIGQUIT
-                    )
-                }) {
-                    return; // the writer thread dies with the process
-                }
+            if stop_signalled(sig_r, 20) {
+                return; // the writer thread dies with the process
             }
         }
         let _ = self.handle.join();
     }
+}
+
+/// Why a drain-time send gave up.
+enum Stop {
+    /// No room before the cap: the chunk comes back.
+    Full((RawFd, Vec<u8>)),
+    /// A stop signal arrived.
+    Signal,
+}
+
+/// Wait up to `ms` for the signal pipe; true if INT/TERM/HUP/QUIT arrived.
+fn stop_signalled(sig_r: RawFd, ms: i32) -> bool {
+    let mut p = libc::pollfd {
+        fd: sig_r,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    unsafe { libc::poll(&mut p, 1, ms) };
+    let mut sb = [0u8; 64];
+    let mut stop = false;
+    while let Some(n) = read_some(sig_r, &mut sb).filter(|n| *n > 0) {
+        stop |= sb[..n].iter().any(|&s| {
+            matches!(
+                s as libc::c_int,
+                libc::SIGINT | libc::SIGTERM | libc::SIGHUP | libc::SIGQUIT
+            )
+        });
+    }
+    stop
+}
+
+/// Is any process of group `pgid` still alive?
+fn group_alive(pgid: i32) -> bool {
+    pgid > 0 && unsafe { libc::kill(-pgid, 0) } == 0
 }
 
 /// Has `pid` exited? Looks without reaping (WNOWAIT), so the zombie keeps its
@@ -822,6 +874,8 @@ pub fn run(opts: Options) -> Outcome {
     // Hard stop for the drain: a grandchild that keeps writing after the
     // leader exited (`sh -c 'yes &'`) must not keep us alive forever.
     let mut drain_cap: Option<Instant> = None;
+    // INT/TERM/HUP/QUIT while draining to a stalled reader: stop teeing.
+    let mut aborted = false;
     // Forwarded keystrokes the PTY has not accepted yet. While non-empty we
     // wait for POLLOUT on the master instead of reading more stdin, so a
     // big paste can never block the loop (and with it the output drain).
@@ -832,10 +886,19 @@ pub fn run(opts: Options) -> Outcome {
         // (the timers are done), so the drain flushes with blocking sends and
         // never stops reading because the queue is full.
         let draining = status.is_some();
+        // While draining: does anything of the child's group still live (and
+        // so may keep writing)? Only then does the 3 s cap apply; the output
+        // an exited group left behind is finite and is always teed in full.
+        let writers_left = draining && group_alive(pid);
+        let cap = if writers_left { drain_cap } else { None };
         if let Some(h) = held.take() {
-            held = match drain_cap {
-                Some(cap) if draining => tee.send_until(h, cap).err(),
-                _ => tee.try_send(h).err(),
+            held = match tee.send_draining(h, draining, cap, sig_r.as_raw_fd()) {
+                Ok(()) => None,
+                Err(Stop::Full(back)) => Some(back),
+                Err(Stop::Signal) => {
+                    aborted = true;
+                    None
+                }
             };
         }
         // Poll set: signal pipe, open outputs (unless backpressured), stdin
@@ -908,7 +971,7 @@ pub fn run(opts: Options) -> Outcome {
             while open[i] && held.is_none() {
                 // The drain is bounded even while data keeps coming (a
                 // grandchild writing faster than our reader consumes).
-                if drain_cap.is_some_and(|c| Instant::now() >= c) {
+                if cap.is_some_and(|c| Instant::now() >= c) {
                     break 'outputs;
                 }
                 match read_some(fd.as_raw_fd(), &mut buf) {
@@ -917,13 +980,16 @@ pub fn run(opts: Options) -> Outcome {
                         got_output = true;
                         w.on_output(&buf[..n]);
                         let chunk = (if *is_err { 2 } else { 1 }, buf[..n].to_vec());
-                        let sent = match drain_cap {
-                            Some(cap) if draining => tee.send_until(chunk, cap),
-                            _ => tee.try_send(chunk),
-                        };
-                        if let Err(back) = sent {
-                            held = Some(back);
-                            break 'outputs;
+                        match tee.send_draining(chunk, draining, cap, sig_r.as_raw_fd()) {
+                            Ok(()) => {}
+                            Err(Stop::Full(back)) => {
+                                held = Some(back);
+                                break 'outputs;
+                            }
+                            Err(Stop::Signal) => {
+                                aborted = true;
+                                break 'outputs;
+                            }
                         }
                     }
                     None => open[i] = false,
@@ -987,16 +1053,32 @@ pub fn run(opts: Options) -> Outcome {
         if status.is_some()
             && (open.iter().all(|o| !o)
                 || (drain_until.is_some_and(|d| now >= d) && !got_output && held.is_none())
-                || drain_cap.is_some_and(|d| now >= d))
+                || aborted
+                || (writers_left && drain_cap.is_some_and(|d| now >= d)))
         {
             break;
         }
     }
 
-    // A chunk still held when the cap hit is dropped: the cap bounds the
-    // drain, documented as such. What is queued gets flushed below.
-    drop(held);
-    tee.finish(sig_r.as_raw_fd());
+    // Only output from processes still writing after the 3 s cap, or output
+    // left when we were told to stop, is ever dropped, and never silently.
+    if let Some((_, h)) = held.take() {
+        log(
+            opts.quiet,
+            &format!(
+                "drain stopped ({}): {} bytes of output not teed",
+                if aborted {
+                    "signal"
+                } else {
+                    "3 s cap, processes still writing"
+                },
+                h.len()
+            ),
+        );
+    }
+    if !aborted {
+        tee.finish(sig_r.as_raw_fd());
+    }
     let Some(st) = status else {
         log(opts.quiet, "lost the child's exit status");
         return Outcome::Code(1);
