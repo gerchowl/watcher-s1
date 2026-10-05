@@ -279,4 +279,4 @@ DEVKIT_DRIFT_CHECK=
 # fails ONE early ci.yml step when a declared language's marker file is missing;
 # `nix` is declared but never gated (no single marker file). Written back only
 # for a non-empty value (#1478).
-DEVKIT_LANGUAGES=
+DEVKIT_LANGUAGES=rust
