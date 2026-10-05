@@ -1,0 +1,60 @@
+# Seeded by vigOS devkit — yours to edit; upgrades never overwrite this file.
+# Bugs / missing tools: https://github.com/vig-os/devkit/issues
+
+#
+# Token ceiling (#1144): release.yml's `extension` caller job grants this seam a
+# ceiling of contents:read, packages:write, id-token:write, attestations:write —
+# the maximum a job here can reach (a called workflow can only downgrade the
+# caller's GITHUB_TOKEN, never elevate it). This default no-op stays read-only;
+# to publish/sign/attest, declare the scopes you need on YOUR job (up to that
+# ceiling), e.g. `permissions: { id-token: write, attestations: write }`. See
+# "Extension Hook" in docs/DOWNSTREAM_RELEASE.md.
+
+name: Release Extension
+
+on:  # yamllint disable-line rule:truthy
+  workflow_call:
+    inputs:
+      version:
+        description: "Release version"
+        required: true
+        type: string
+      finalize_sha:
+        description: "Finalized commit SHA"
+        required: true
+        type: string
+      release_date:
+        description: "Release date"
+        required: true
+        type: string
+      release_kind:
+        description: "Release kind (candidate or final)"
+        required: true
+        type: string
+      publish_version:
+        description: "Version tag that will be published (X.Y.Z or X.Y.Z-rcN)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  extension:
+    name: Extension Hook (Default No-op)
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Default extension summary
+        env:
+          VERSION: ${{ inputs.version }}
+          FINALIZE_SHA: ${{ inputs.finalize_sha }}
+          RELEASE_DATE: ${{ inputs.release_date }}
+          RELEASE_KIND: ${{ inputs.release_kind }}
+          PUBLISH_VERSION: ${{ inputs.publish_version }}
+        run: |
+          echo "No release extension configured."
+          echo "Version: $VERSION"
+          echo "Release kind: $RELEASE_KIND"
+          echo "Publish version: $PUBLISH_VERSION"
+          echo "Finalize SHA: $FINALIZE_SHA"
+          echo "Release date: $RELEASE_DATE"
