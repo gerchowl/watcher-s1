@@ -40,17 +40,40 @@ permissions:
   contents: read
 
 jobs:
-  extension:
-    name: Extension Hook (Default No-op)
-    runs-on: ${{ fromJSON(inputs.runner-json) }}
+  # The flake package g-fleet consumes: build it on Linux and on Apple
+  # silicon, then smoke-test exit fidelity on the built binary. macOS also
+  # runs the full test suite, which covers the darwin-only paths (the `ps`
+  # probe, BSD PTY behaviour) that the Linux lanes in ci.yml cannot.
+  package:
+    name: Package (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     steps:
-      - name: Default extension summary
-        env:
-          MODE: ${{ inputs.mode }}
-          IMAGE: ${{ inputs.image }}
-          IMAGE_TAG: ${{ inputs.image-tag }}
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24  # v31.11.1
+
+      - name: Build packages.default
+        run: nix build .#default -L
+
+      - name: Smoke-test the built binary
         run: |
-          echo "No CI extension configured."
-          echo "Mode: $MODE"
-          echo "Image: $IMAGE"
-          echo "Image tag: $IMAGE_TAG"
+          ./result/bin/watcher-s1 --version
+          set +e
+          ./result/bin/watcher-s1 --no-s1 -q --events smoke.jsonl -- sh -c 'echo hi; exit 3'
+          rc=$?
+          set -e
+          test "$rc" -eq 3
+          grep -q '"code":3' smoke.jsonl
+
+      - name: Test suite (macOS)
+        if: runner.os == 'macOS'
+        run: nix develop -c cargo test --locked
