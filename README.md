@@ -210,6 +210,47 @@ watcher-s1 --silence 10m --timeout 2h --events /tmp/build.events -- nix build .#
 - Without `--events`, events land on stderr as `watcher-s1: {…}` lines, which
   the background task's output file captures alongside the command's output.
 
+### PostToolUse hook: masked pipes
+
+`… | tail` hides the producer's exit status: the Bash tool reports the
+filter's 0. In g-fleet#244's audit, about 3–10 % of agents' piped exit-0
+Bash calls hid a real failure. `watcher-s1 judge --posttooluse` catches them
+without wrapping anything:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "watcher-s1", "args": ["judge", "--posttooluse"], "timeout": 5 }
+        ]
+      }
+    ]
+  }
+}
+```
+
+PostToolUse only fires for successful calls, so every input is an exit 0. The
+hook acts only when all of these hold: the command pipes into a filter
+(`tail`, `head`, `grep`, `rg`, `sed`, `awk`, `sort`, `tee`, `jq`, …; a
+`pipefail` command is skipped), the call was neither backgrounded nor
+interrupted, and a System One endpoint is configured (same precedence as
+above). It judges the last 4 KB of stdout and stderr. At fused ≥ threshold it
+prints:
+
+```json
+{"hookSpecificOutput": {"hookEventName": "PostToolUse",
+  "additionalContext": "watcher-s1: exit 0 came from the pipe; the output shows an unrecovered failure: error: could not compile `foo` … (System One fused score 0.86 >= 0.80). Re-run without the filter, or with `set -o pipefail`, before trusting this result."}}
+```
+
+Claude Code shows that next to the tool result. Otherwise it is a silent
+no-op. A watchdog caps the whole hook at 2.9 s (the System One call gets
+what remains), it always exits 0 and prints nothing on stderr, and any error
+(bad JSON, endpoint down, breaker open) fails open. It never blocks the tool,
+which has already run anyway.
+
 ## Development
 
 This repo uses [vig-os/devkit](https://github.com/vig-os/devkit) (direnv mode,
