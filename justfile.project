@@ -91,6 +91,11 @@ update:
 build:
     cargo build --release --locked
 
+# Run the Rust pack's flake checks (clippy, fmt, nextest, doctest, doc)
+[group('test')]
+flake-check:
+    nix flake check -L
+
 # Build the flake package (what g-fleet consumes)
 [group('build')]
 nix-build:

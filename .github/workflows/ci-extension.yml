@@ -41,9 +41,10 @@ permissions:
 
 jobs:
   # The flake package g-fleet consumes: build it on Linux and on Apple
-  # silicon, then smoke-test exit fidelity on the built binary. macOS also
-  # runs the full test suite, which covers the darwin-only paths (the `ps`
-  # probe, BSD PTY behaviour) that the Linux lanes in ci.yml cannot.
+  # silicon, smoke-test exit fidelity on the built binary, and run the Rust
+  # pack's checks (mkRustProject: clippy, fmt, nextest, doctest, doc). On
+  # macOS that covers the darwin-only paths (the `ps` probe, BSD PTY
+  # behaviour) that the Linux lanes in ci.yml cannot.
   package:
     name: Package (${{ matrix.os }})
     strategy:
@@ -74,6 +75,5 @@ jobs:
           test "$rc" -eq 3
           grep -q '"code":3' smoke.jsonl
 
-      - name: Test suite (macOS)
-        if: runner.os == 'macOS'
-        run: nix develop -c cargo test --locked
+      - name: Flake checks (clippy, fmt, nextest, doctest, doc)
+        run: nix flake check -L
