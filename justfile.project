@@ -100,7 +100,7 @@ nix-build:
 [group('test')]
 test-kev url=env("SYSTEMONE_URL", ""):
     @if [ -z "{{ url }}" ]; then echo "just test-kev: set SYSTEMONE_URL or pass url=..." >&2; exit 2; fi
-    SYSTEMONE_URL="{{ url }}" cargo test --locked --test kev -- --nocapture --test-threads=1
+    WATCHER_S1_KEV_URL="{{ url }}" cargo test --locked --test kev -- --nocapture --test-threads=1
 
 # Clean build artifacts
 [group('build')]
