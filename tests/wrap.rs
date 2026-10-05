@@ -707,7 +707,7 @@ fn log_mode_watches_a_growing_file() {
     // Rotation: a new file at the same path is followed.
     std::fs::rename(&log, e.path("job.log.1")).unwrap();
     std::fs::write(&log, "Overwrite existing deployment? [y/N] ").unwrap();
-    std::thread::sleep(Duration::from_millis(900));
+    std::thread::sleep(Duration::from_millis(1500));
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     let o = child.wait_with_output().unwrap();
     assert_eq!(o.status.signal(), Some(libc::SIGTERM));
@@ -725,4 +725,35 @@ fn log_mode_watches_a_growing_file() {
     assert_eq!(prompt["prompt"], "Overwrite existing deployment? [y/N]");
     assert_eq!(prompt["pid"], 0);
     assert!(prompt["cmd"].as_str().unwrap().starts_with("--log "));
+}
+
+#[test]
+fn every_byte_arrives_behind_a_slow_reader() {
+    // 5 MiB from one process, then 40 000 bytes from a second writer, read
+    // slowly enough that the writer queue stays full: nothing may be lost
+    // when the leader exits while output is still queued or in the pipe.
+    use std::io::Read;
+    let e = Env::new();
+    let mut c = e.cmd();
+    c.args(["--no-s1", "-q", "--pipe", "--silence", "0", "--"])
+        .args([
+            "sh",
+            "-c",
+            "head -c 5242880 /dev/zero; (sleep 0.2; head -c 40000 /dev/zero) & sleep 0.05",
+        ])
+        .stdout(std::process::Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    let mut out = child.stdout.take().unwrap();
+    let mut total = 0usize;
+    let mut buf = vec![0u8; 65536];
+    loop {
+        let n = out.read(&mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        total += n;
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    assert!(child.wait().unwrap().success());
+    assert_eq!(total, 5_242_880 + 40_000, "output lost");
 }

@@ -119,9 +119,10 @@ pub fn post_json(url: &str, body: &[u8], deadline: Instant) -> Result<Response, 
     }
     let tcp = stream.ok_or(last)?;
     let _ = tcp.set_nodelay(true);
-    // Keep a handle on the socket: deadlines are enforced on it even when
-    // the bytes travel through TLS.
-    let sock = tcp.try_clone().map_err(|e| e.to_string())?;
+    // Every socket read and write (TLS handshake included) re-arms its
+    // timeout from the one deadline, so a server that drips bytes cannot
+    // stretch the call.
+    let tcp = DeadlineStream { tcp, deadline };
     let mut s: Box<dyn ReadWrite> = if u.tls {
         let name = rustls::pki_types::ServerName::try_from(u.host.clone()).map_err(|e| format!("tls name: {e}"))?;
         let conn = rustls::ClientConnection::new(tls_config()?, name).map_err(|e| format!("tls: {e}"))?;
@@ -142,11 +143,6 @@ pub fn post_json(url: &str, body: &[u8], deadline: Instant) -> Result<Response, 
         env!("CARGO_PKG_VERSION"),
         body.len()
     );
-    sock.set_write_timeout(Some(remaining(deadline)?))
-        .map_err(|e| e.to_string())?;
-    // The TLS handshake reads before the first write completes.
-    sock.set_read_timeout(Some(remaining(deadline)?))
-        .map_err(|e| e.to_string())?;
     s.write_all(head.as_bytes())
         .and_then(|_| s.write_all(body))
         .map_err(|e| io_err("write", e))?;
@@ -154,8 +150,6 @@ pub fn post_json(url: &str, body: &[u8], deadline: Instant) -> Result<Response, 
     let mut raw = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
-        sock.set_read_timeout(Some(remaining(deadline)?))
-            .map_err(|e| e.to_string())?;
         match s.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
@@ -168,10 +162,49 @@ pub fn post_json(url: &str, body: &[u8], deadline: Instant) -> Result<Response, 
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // TLS peer closed without close_notify: for a `Connection: close`
+            // response that is the end of the body; `complete` still checks
+            // the framing below.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(io_err("read", e)),
         }
     }
     complete(&raw, true)?.ok_or_else(|| "truncated response".into())
+}
+
+/// A TCP stream whose every read and write is bounded by `deadline`.
+struct DeadlineStream {
+    tcp: TcpStream,
+    deadline: Instant,
+}
+
+impl DeadlineStream {
+    fn arm(&self) -> std::io::Result<()> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "deadline"));
+        }
+        self.tcp.set_read_timeout(Some(left))?;
+        self.tcp.set_write_timeout(Some(left))
+    }
+}
+
+impl Read for DeadlineStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.arm()?;
+        self.tcp.read(buf)
+    }
+}
+
+impl Write for DeadlineStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.arm()?;
+        self.tcp.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.tcp.flush()
+    }
 }
 
 trait ReadWrite: Read + Write {}
@@ -188,8 +221,9 @@ fn tls_config() -> Result<TlsConfig, String> {
         if let Some(path) = std::env::var_os("SSL_CERT_FILE") {
             use rustls::pki_types::{CertificateDer, pem::PemObject};
             let certs = CertificateDer::pem_file_iter(&path).map_err(|e| format!("SSL_CERT_FILE: {e}"))?;
-            for c in certs.flatten() {
-                let _ = roots.add(c);
+            for c in certs {
+                let c = c.map_err(|e| format!("SSL_CERT_FILE: {e}"))?;
+                roots.add(c).map_err(|e| format!("SSL_CERT_FILE: {e}"))?;
             }
         }
         let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());

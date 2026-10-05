@@ -437,6 +437,7 @@ impl<'a> Watch<'a> {
         // TERM/KILL escalation.
         if let (Some(after), Some(since)) = (self.opts.prompt_cancel, self.prompt_since)
             && !self.cancel_fired
+            && !self.timeout_fired
             && self.run.pgid > 0
             && now.duration_since(since) >= after
         {
@@ -792,8 +793,16 @@ pub fn run(opts: Options) -> Outcome {
     let mut pending: Vec<u8> = Vec::new();
 
     loop {
+        // After the child exited nothing needs the loop to stay responsive
+        // (the timers are done), so the drain flushes with blocking sends and
+        // never stops reading because the queue is full.
+        let draining = status.is_some();
         if let Some(h) = held.take() {
-            held = tee.try_send(h).err();
+            if draining {
+                tee.send(h);
+            } else {
+                held = tee.try_send(h).err();
+            }
         }
         // Poll set: signal pipe, open outputs (unless backpressured), stdin
         // when forwarding.
@@ -860,14 +869,18 @@ pub fn run(opts: Options) -> Outcome {
         }
 
         // Output: into the ring, and to the writer to tee through unchanged.
+        let mut got_output = false;
         'outputs: for (i, (fd, is_err)) in sp.outputs.iter().enumerate() {
             while open[i] && held.is_none() {
                 match read_some(fd.as_raw_fd(), &mut buf) {
                     Some(0) => break,
                     Some(n) => {
+                        got_output = true;
                         w.on_output(&buf[..n]);
                         let chunk = (if *is_err { 2 } else { 1 }, buf[..n].to_vec());
-                        if let Err(back) = tee.try_send(chunk) {
+                        if draining {
+                            tee.send(chunk);
+                        } else if let Err(back) = tee.try_send(chunk) {
                             held = Some(back);
                             break 'outputs;
                         }
@@ -925,7 +938,12 @@ pub fn run(opts: Options) -> Outcome {
                 w.tick(now);
             }
         }
-        if status.is_some() && (open.iter().all(|o| !o) || drain_until.is_some_and(|d| now >= d)) {
+        // Leave once every output is closed, or once the grace for new data
+        // is over AND a full read pass found nothing: bytes already in the
+        // pipes are always teed, however slow our reader is.
+        if status.is_some()
+            && (open.iter().all(|o| !o) || (drain_until.is_some_and(|d| now >= d) && !got_output && held.is_none()))
+        {
             break;
         }
     }
@@ -1018,7 +1036,10 @@ pub fn run_log(opts: Options, path: &std::path::Path) -> Outcome {
         match &mut file {
             None => file = open_at_end(&mut w),
             Some((f, offset, ino)) => {
-                // Rotation (new inode) or truncation: start over at offset 0.
+                // Finish what the current handle holds first: lines written
+                // to the old file just before a rename still belong to it.
+                drain_file(f, offset, &mut w, &mut buf);
+                // Rotation (new inode) or truncation: continue at offset 0.
                 if let Ok(meta) = std::fs::metadata(path)
                     && (meta.ino() != *ino || meta.len() < *offset)
                     && let Ok(nf) = std::fs::File::open(path)
@@ -1026,19 +1047,25 @@ pub fn run_log(opts: Options, path: &std::path::Path) -> Outcome {
                     *f = nf;
                     *offset = 0;
                     *ino = meta.ino();
-                }
-                loop {
-                    match f.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            *offset += n as u64;
-                            w.on_output(&buf[..n]);
-                        }
-                    }
+                    drain_file(f, offset, &mut w, &mut buf);
                 }
             }
         }
         w.tick(Instant::now());
+    }
+}
+
+/// Read `f` to its current end, feeding the watch.
+fn drain_file(f: &mut std::fs::File, offset: &mut u64, w: &mut Watch<'_>, buf: &mut [u8]) {
+    use std::io::Read;
+    loop {
+        match f.read(buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                *offset += n as u64;
+                w.on_output(&buf[..n]);
+            }
+        }
     }
 }
 
