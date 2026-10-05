@@ -1,0 +1,100 @@
+# Consumer-owned (not managed by devkit). Builds the release binaries into the
+# release train's DRAFT GitHub Release during the pre-publish assets window:
+# release-publish.yml creates the draft before it pushes the tag, so this
+# tag-push workflow always finds it; promote-release.yml publishes it later.
+# Never publishes the Release itself. See docs/DOWNSTREAM_RELEASE.md,
+# "Release owner and the pre-publish assets window".
+#
+# Linux binaries are fully static (musl), so they run on any distribution;
+# the macOS binary is for Apple silicon.
+
+name: Release Binaries
+
+on:  # yamllint disable-line rule:truthy
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: ubuntu-latest, target: x86_64-unknown-linux-musl}
+          - {runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl}
+          - {runner: macos-latest, target: aarch64-apple-darwin}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the musl C toolchain (ring needs a C compiler)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup target add "$TARGET"
+          cargo build --release --locked --target "$TARGET"
+
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          name="watcher-s1-$TAG-$TARGET"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/watcher-s1" README.md LICENSE event.schema.json "dist/$name/"
+          "dist/$name/watcher-s1" --version
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+
+      - name: Keep the archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: bin-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  upload:
+    name: Upload into the draft Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write  # upload into the draft; never publish it
+    steps:
+      - name: Fetch the archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: bin-*
+          path: dist
+          merge-multiple: true
+
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! IS_DRAFT=$(gh release view "$TAG" --json isDraft --jq .isDraft); then
+            echo "No Release for $TAG (tag-only candidate): nothing to upload."
+            exit 0
+          fi
+          if [ "$IS_DRAFT" != "true" ]; then
+            echo "::error::$TAG is already published; assets must land before promote"
+            exit 1
+          fi
+          gh release upload "$TAG" dist/* --clobber

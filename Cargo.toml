@@ -6,6 +6,11 @@ rust-version = "1.95"
 description = "Truthful command wrapper that detects stalls, prompts and masked failures"
 license = "Apache-2.0"
 repository = "https://github.com/gerchowl/watcher-s1"
+readme = "README.md"
+keywords = ["supervisor", "watchdog", "pty", "claude-code", "monitoring"]
+categories = ["command-line-utilities", "development-tools"]
+# What crates.io gets: the crate and its embedded data, not CI, eval or devkit files.
+include = ["/src", "/tests", "/questions", "/event.schema.json", "/README.md", "/LICENSE", "/Cargo.toml", "/Cargo.lock"]
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
