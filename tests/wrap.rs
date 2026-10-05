@@ -453,3 +453,272 @@ fn inherited_sighup_ignore_is_respected() {
     assert!(o.status.success(), "{:?}", o.status);
     assert!(String::from_utf8_lossy(&o.stdout).contains("survived"));
 }
+
+/// Re-exec target for the blocked-state test, not a test on its own: with
+/// WATCHER_S1_VFORK_HOLD set it vforks a child that sleeps before exiting.
+/// Until the child exits, the vfork parent sits in uninterruptible wait
+/// (Linux `D`), a real kernel-level block.
+#[test]
+fn helper_vfork_hold() {
+    let Some(secs) = std::env::var("WATCHER_S1_VFORK_HOLD")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+    else {
+        return;
+    };
+    #[allow(deprecated)]
+    unsafe {
+        if libc::vfork() == 0 {
+            // Only async-signal-safe syscalls in a vfork child.
+            libc::sleep(secs);
+            libc::_exit(0);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_really_blocked_process_raises_stalled_blocked() {
+    let e = Env::new();
+    let me = std::env::current_exe().unwrap();
+    let r = run({
+        let mut c = e.cmd();
+        c.env("WATCHER_S1_VFORK_HOLD", "3")
+            .args([
+                "--no-s1",
+                "-q",
+                "--sample-every",
+                "200ms",
+                "--blocked-after",
+                "500ms",
+                "--silence",
+                "0",
+                "--",
+            ])
+            .arg(me)
+            .args(["--exact", "helper_vfork_hold", "--test-threads=1", "-q"]);
+        c
+    });
+    assert!(r.status.success(), "{:?} {}", r.status, r.stderr);
+    let ev = e.events();
+    let blocked = ev
+        .iter()
+        .find(|x| x["reason"] == "blocked")
+        .unwrap_or_else(|| panic!("{ev:?}"));
+    assert_eq!(blocked["state"], "stalled");
+    assert_eq!(blocked["proc"]["probe"], "ok");
+    let procs = blocked["proc"]["blocked"].as_array().unwrap();
+    assert!(
+        procs.iter().any(|p| p["state"].as_str().unwrap().starts_with('D')),
+        "{procs:?}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_really_blocked_process_raises_stalled_blocked_on_darwin() {
+    let e = Env::new();
+    let me = std::env::current_exe().unwrap();
+    let r = run({
+        let mut c = e.cmd();
+        c.env("WATCHER_S1_VFORK_HOLD", "4")
+            .args([
+                "--no-s1",
+                "-q",
+                "--sample-every",
+                "300ms",
+                "--blocked-after",
+                "800ms",
+                "--silence",
+                "0",
+                "--",
+            ])
+            .arg(me)
+            .args(["--exact", "helper_vfork_hold", "--test-threads=1", "-q"]);
+        c
+    });
+    assert!(r.status.success(), "{:?} {}", r.status, r.stderr);
+    let ev = e.events();
+    let blocked = ev
+        .iter()
+        .find(|x| x["reason"] == "blocked")
+        .unwrap_or_else(|| panic!("{ev:?}"));
+    let procs = blocked["proc"]["blocked"].as_array().unwrap();
+    assert!(
+        procs.iter().any(|p| p["state"].as_str().unwrap().starts_with('U')),
+        "{procs:?}"
+    );
+}
+
+#[test]
+fn a_stalled_stdout_reader_does_not_stall_the_timeout() {
+    // Nobody reads our stdout: the pipe fills after ~64 KiB. The timeout
+    // must still fire (it used to block behind the write).
+    use std::io::BufRead;
+    let e = Env::new();
+    let mut c = e.cmd();
+    c.args(["--no-s1", "--timeout", "1s", "--kill-grace", "300ms", "--"])
+        .args(["sh", "-c", "head -c 150000 /dev/zero | tr '\\\\0' x; sleep 30"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let t0 = std::time::Instant::now();
+    let mut child = c.spawn().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let mut saw = false;
+    for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+        if line.contains("timeout after") {
+            saw = true;
+            break;
+        }
+    }
+    assert!(saw, "no timeout log line");
+    assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+    // Now drain stdout so the watcher can finish its writes and exit.
+    let mut out = child.stdout.take().unwrap();
+    let mut sink = Vec::new();
+    std::io::Read::read_to_end(&mut out, &mut sink).unwrap();
+    let st = child.wait().unwrap();
+    assert_eq!(st.signal(), Some(libc::SIGTERM), "{st:?}");
+    assert_eq!(sink.len(), 150_000, "output lost");
+    assert_eq!(last(&e.events())["reason"], "timeout");
+}
+
+#[test]
+fn on_prompt_cancel_interrupts_an_unanswered_prompt() {
+    let e = Env::new();
+    let r = run({
+        let mut c = e.cmd();
+        c.args(["--no-s1", "-q", "--silence", "0", "--prompt-after", "200ms"])
+            .args([
+                "--on-prompt",
+                "cancel",
+                "--prompt-cancel-after",
+                "300ms",
+                "--kill-grace",
+                "300ms",
+                "--",
+            ])
+            .args([
+                "sh",
+                "-c",
+                "printf 'Password: ' > /dev/tty; read x < /dev/tty; echo answered",
+            ]);
+        c
+    });
+    assert!(r.status.signal().is_some(), "{:?}", r.status);
+    assert!(r.elapsed < Duration::from_secs(4), "{:?}", r.elapsed);
+    assert!(!r.out().contains("answered"));
+    let ev = e.events();
+    assert_eq!(states(&ev)[0], "waiting_on_input/prompt");
+    assert_eq!(last(&ev)["reason"], "prompt_cancelled", "{ev:?}");
+}
+
+#[test]
+fn on_prompt_cancel_escalates_when_sigint_is_ignored() {
+    let e = Env::new();
+    let r = run({
+        let mut c = e.cmd();
+        c.args(["--no-s1", "-q", "--silence", "0", "--prompt-after", "200ms"])
+            .args([
+                "--on-prompt",
+                "cancel",
+                "--prompt-cancel-after",
+                "200ms",
+                "--kill-grace",
+                "300ms",
+                "--",
+            ])
+            .args([
+                "sh",
+                "-c",
+                "trap '' INT; printf 'Continue? [y/N] ' > /dev/tty; read x < /dev/tty",
+            ]);
+        c
+    });
+    assert_eq!(r.status.signal(), Some(libc::SIGTERM), "{:?}", r.status);
+    assert_eq!(last(&e.events())["reason"], "prompt_cancelled");
+}
+
+#[test]
+fn default_on_prompt_only_reports() {
+    let e = Env::new();
+    let r = run({
+        let mut c = e.cmd();
+        c.args([
+            "--no-s1",
+            "-q",
+            "--silence",
+            "0",
+            "--prompt-after",
+            "200ms",
+            "--timeout",
+            "1500ms",
+        ])
+        .args([
+            "--kill-grace",
+            "200ms",
+            "--",
+            "sh",
+            "-c",
+            "printf 'Password: ' > /dev/tty; read x < /dev/tty",
+        ]);
+        c
+    });
+    assert_eq!(
+        last(&e.events())["reason"],
+        "timeout",
+        "the prompt was left alone until the timeout"
+    );
+    let _ = r;
+}
+
+#[test]
+fn log_mode_watches_a_growing_file() {
+    use std::io::Write as _;
+    let e = Env::new();
+    let log = e.path("job.log");
+    std::fs::write(&log, "old content\n").unwrap();
+    let mut c = e.cmd();
+    c.args([
+        "--no-s1",
+        "-q",
+        "--silence",
+        "600ms",
+        "--prompt-after",
+        "300ms",
+        "--log",
+    ])
+    .arg(&log)
+    .stdout(std::process::Stdio::piped());
+    let child = c.spawn().unwrap();
+    let append = |s: &str| {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        f.write_all(s.as_bytes()).unwrap();
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    append("step 1 done\n");
+    std::thread::sleep(Duration::from_millis(1000)); // > --silence: stalled
+    append("step 2 done\n"); // resumed
+    std::thread::sleep(Duration::from_millis(300));
+    // Rotation: a new file at the same path is followed.
+    std::fs::rename(&log, e.path("job.log.1")).unwrap();
+    std::fs::write(&log, "Overwrite existing deployment? [y/N] ").unwrap();
+    std::thread::sleep(Duration::from_millis(900));
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let o = child.wait_with_output().unwrap();
+    assert_eq!(o.status.signal(), Some(libc::SIGTERM));
+    assert!(o.stdout.is_empty(), "log mode must not tee");
+    let ev = e.events();
+    let st = states(&ev);
+    assert!(
+        st.starts_with(&["stalled/silence".to_string(), "progressing/resumed".to_string()]),
+        "{st:?}"
+    );
+    let prompt = ev
+        .iter()
+        .find(|x| x["state"] == "waiting_on_input")
+        .unwrap_or_else(|| panic!("{st:?}"));
+    assert_eq!(prompt["prompt"], "Overwrite existing deployment? [y/N]");
+    assert_eq!(prompt["pid"], 0);
+    assert!(prompt["cmd"].as_str().unwrap().starts_with("--log "));
+}

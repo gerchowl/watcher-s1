@@ -1,7 +1,7 @@
 use clap::Parser;
 use std::sync::Arc;
 use watcher_s1::breaker::{Breaker, default_state_dir};
-use watcher_s1::cli::{Cli, S1Args, Sub};
+use watcher_s1::cli::{Cli, OnPrompt, S1Args, Sub};
 use watcher_s1::config::{self, S1Config};
 use watcher_s1::event::Sink;
 use watcher_s1::judge;
@@ -95,9 +95,13 @@ fn main() {
         sample_every: w.sample_every,
         blocked_after: w.blocked_after,
         probe_timeout: w.probe_timeout,
+        prompt_cancel: (w.on_prompt == OnPrompt::Cancel).then_some(w.prompt_cancel_after),
         evidence_bytes: w.evidence_bytes,
         sink,
         quiet: w.quiet,
     };
-    supervise::exit_like(supervise::run(opts))
+    match w.log {
+        Some(path) => supervise::exit_like(supervise::run_log(opts, &path)),
+        None => supervise::exit_like(supervise::run(opts)),
+    }
 }

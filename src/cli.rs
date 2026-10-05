@@ -1,6 +1,6 @@
 //! Command-line surface.
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -113,6 +113,18 @@ pub struct WrapArgs {
     /// Wall-clock limit for one process-state probe.
     #[arg(long, value_name = "DUR", default_value = "2s", value_parser = parse_duration)]
     pub probe_timeout: Duration,
+    /// What to do about a prompt nobody answers: `wait` (only report it) or
+    /// `cancel` (SIGINT the group after --prompt-cancel-after, then TERM and
+    /// KILL). Never answers the prompt.
+    #[arg(long, value_enum, default_value_t = OnPrompt::Wait)]
+    pub on_prompt: OnPrompt,
+    /// With `--on-prompt cancel`: how long a prompt may wait unanswered.
+    #[arg(long, value_name = "DUR", default_value = "60s", value_parser = parse_duration)]
+    pub prompt_cancel_after: Duration,
+    /// Passive mode: watch a growing log FILE instead of running a command
+    /// (silence, prompts and System One at the silence threshold; no exit).
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["pipe", "timeout", "on_prompt"])]
+    pub log: Option<PathBuf>,
     /// Bytes of output tail carried in each event.
     #[arg(long, value_name = "N", default_value_t = 1500)]
     pub evidence_bytes: usize,
@@ -128,8 +140,14 @@ pub struct WrapArgs {
     #[command(flatten)]
     pub s1: S1Args,
     /// The command to run, after `--`.
-    #[arg(last = true, required = true, value_name = "CMD")]
+    #[arg(last = true, required_unless_present = "log", value_name = "CMD")]
     pub cmd: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OnPrompt {
+    Wait,
+    Cancel,
 }
 
 #[cfg(test)]
@@ -155,6 +173,11 @@ mod tests {
         assert_eq!(c.wrap.cmd, ["ls", "-la"]);
         assert_eq!(c.wrap.silence, Duration::from_secs(60));
         assert!(Cli::try_parse_from(["watcher-s1"]).is_err());
+        let c = Cli::try_parse_from(["watcher-s1", "--log", "/var/log/x.log"]).unwrap();
+        assert!(c.wrap.cmd.is_empty() && c.wrap.log.is_some());
+        assert!(Cli::try_parse_from(["watcher-s1", "--log", "x", "--timeout", "1s"]).is_err());
+        let c = Cli::try_parse_from(["watcher-s1", "--on-prompt", "cancel", "--", "x"]).unwrap();
+        assert_eq!(c.wrap.on_prompt, OnPrompt::Cancel);
         // A command that looks like a flag still belongs to the child.
         let c = Cli::try_parse_from(["watcher-s1", "--", "judge", "--posttooluse"]).unwrap();
         assert_eq!(c.wrap.cmd, ["judge", "--posttooluse"]);

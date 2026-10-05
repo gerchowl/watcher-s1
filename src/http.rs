@@ -1,7 +1,8 @@
 //! A deliberately tiny HTTP/1.1 POST client with one wall-clock deadline
-//! covering DNS, connect, write and read. Plain `http://` only: System One
-//! endpoints live on the tailnet. No async runtime, no TLS stack, so the
-//! binary stays small and the deadline is ours to enforce.
+//! covering DNS, connect, TLS handshake, write and read. `http://` and
+//! `https://` (rustls with the `ring` provider; trust roots are the bundled
+//! Mozilla set plus any PEM bundle named by `SSL_CERT_FILE`). No async
+//! runtime, so the deadline is ours to enforce on the socket.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -11,15 +12,21 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Url {
+    pub tls: bool,
     pub host: String,
     pub port: u16,
     pub path: String,
 }
 
 pub fn parse_url(url: &str) -> Result<Url, String> {
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| format!("unsupported URL {url:?}: only http:// is supported"))?;
+    let (tls, rest) = if let Some(r) = url.strip_prefix("https://") {
+        (true, r)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        (false, r)
+    } else {
+        return Err(format!("unsupported URL {url:?}: use http:// or https://"));
+    };
+    let default_port = if tls { 443 } else { 80 };
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
@@ -30,7 +37,7 @@ pub fn parse_url(url: &str) -> Result<Url, String> {
     let (host, port) = if let Some(h) = authority.strip_prefix('[') {
         let end = h.find(']').ok_or_else(|| format!("bad IPv6 literal in {url:?}"))?;
         let port = match &h[end + 1..] {
-            "" => 80,
+            "" => default_port,
             p => p
                 .strip_prefix(':')
                 .and_then(|p| p.parse().ok())
@@ -40,10 +47,11 @@ pub fn parse_url(url: &str) -> Result<Url, String> {
     } else {
         match authority.rsplit_once(':') {
             Some((h, p)) => (h.to_string(), p.parse().map_err(|_| format!("bad port in {url:?}"))?),
-            None => (authority.to_string(), 80),
+            None => (authority.to_string(), default_port),
         }
     };
     Ok(Url {
+        tls,
         host,
         port,
         path: path.to_string(),
@@ -109,8 +117,18 @@ pub fn post_json(url: &str, body: &[u8], deadline: Instant) -> Result<Response, 
             Err(e) => last = format!("connect {a}: {e}"),
         }
     }
-    let mut s = stream.ok_or(last)?;
-    let _ = s.set_nodelay(true);
+    let tcp = stream.ok_or(last)?;
+    let _ = tcp.set_nodelay(true);
+    // Keep a handle on the socket: deadlines are enforced on it even when
+    // the bytes travel through TLS.
+    let sock = tcp.try_clone().map_err(|e| e.to_string())?;
+    let mut s: Box<dyn ReadWrite> = if u.tls {
+        let name = rustls::pki_types::ServerName::try_from(u.host.clone()).map_err(|e| format!("tls name: {e}"))?;
+        let conn = rustls::ClientConnection::new(tls_config()?, name).map_err(|e| format!("tls: {e}"))?;
+        Box::new(rustls::StreamOwned::new(conn, tcp))
+    } else {
+        Box::new(tcp)
+    };
     let host_hdr = if u.host.contains(':') {
         format!("[{}]", u.host)
     } else {
@@ -124,7 +142,10 @@ pub fn post_json(url: &str, body: &[u8], deadline: Instant) -> Result<Response, 
         env!("CARGO_PKG_VERSION"),
         body.len()
     );
-    s.set_write_timeout(Some(remaining(deadline)?))
+    sock.set_write_timeout(Some(remaining(deadline)?))
+        .map_err(|e| e.to_string())?;
+    // The TLS handshake reads before the first write completes.
+    sock.set_read_timeout(Some(remaining(deadline)?))
         .map_err(|e| e.to_string())?;
     s.write_all(head.as_bytes())
         .and_then(|_| s.write_all(body))
@@ -133,7 +154,7 @@ pub fn post_json(url: &str, body: &[u8], deadline: Instant) -> Result<Response, 
     let mut raw = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
-        s.set_read_timeout(Some(remaining(deadline)?))
+        sock.set_read_timeout(Some(remaining(deadline)?))
             .map_err(|e| e.to_string())?;
         match s.read(&mut buf) {
             Ok(0) => break,
@@ -151,6 +172,35 @@ pub fn post_json(url: &str, body: &[u8], deadline: Instant) -> Result<Response, 
         }
     }
     complete(&raw, true)?.ok_or_else(|| "truncated response".into())
+}
+
+trait ReadWrite: Read + Write {}
+impl<T: Read + Write> ReadWrite for T {}
+
+type TlsConfig = std::sync::Arc<rustls::ClientConfig>;
+
+/// One TLS client config per process: bundled roots + SSL_CERT_FILE.
+fn tls_config() -> Result<TlsConfig, String> {
+    static CFG: OnceLock<Result<TlsConfig, String>> = OnceLock::new();
+    CFG.get_or_init(|| {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        if let Some(path) = std::env::var_os("SSL_CERT_FILE") {
+            use rustls::pki_types::{CertificateDer, pem::PemObject};
+            let certs = CertificateDer::pem_file_iter(&path).map_err(|e| format!("SSL_CERT_FILE: {e}"))?;
+            for c in certs.flatten() {
+                let _ = roots.add(c);
+            }
+        }
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| format!("tls: {e}"))?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Ok(std::sync::Arc::new(cfg))
+    })
+    .clone()
 }
 
 fn io_err(what: &str, e: std::io::Error) -> String {
@@ -235,6 +285,7 @@ mod tests {
         assert_eq!(
             parse_url("http://sage.example:8023/v1/systemone").unwrap(),
             Url {
+                tls: false,
                 host: "sage.example".into(),
                 port: 8023,
                 path: "/v1/systemone".into()
@@ -242,7 +293,9 @@ mod tests {
         );
         assert_eq!(parse_url("http://h").unwrap().port, 80);
         assert_eq!(parse_url("http://[::1]:9/x").unwrap().host, "::1");
-        assert!(parse_url("https://h/x").unwrap_err().contains("only http://"));
+        let u = parse_url("https://h/x").unwrap();
+        assert!(u.tls && u.port == 443);
+        assert!(parse_url("ftp://h/x").unwrap_err().contains("http:// or https://"));
         assert!(parse_url("http://h:notaport/x").is_err());
     }
 

@@ -116,12 +116,39 @@ fn sample_all() -> Result<Vec<ProcState>, String> {
 
 #[cfg(target_os = "linux")]
 fn enrich(ps: &mut [ProcState]) {
-    for p in ps.iter_mut().filter(|p| p.blocked()) {
-        p.wchan = std::fs::read_to_string(format!("/proc/{}/wchan", p.pid))
-            .ok()
-            .map(|w| w.trim().to_string())
-            .filter(|w| !w.is_empty() && w != "0");
+    // A wedged process often blocks in a worker thread while its main
+    // thread waits on it in plain `S`, so look at every thread of the tree.
+    for p in ps.iter_mut() {
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{}/task", p.pid)) else {
+            continue;
+        };
+        for t in tasks.flatten() {
+            let tid = t.file_name();
+            let Some(tid) = tid.to_str() else { continue };
+            let Some(ts) = std::fs::read_to_string(t.path().join("stat"))
+                .ok()
+                .and_then(|s| parse_proc_stat(&s))
+            else {
+                continue;
+            };
+            if ts.blocked() {
+                p.state = ts.state;
+                if ts.comm != p.comm {
+                    p.comm = format!("{}/{}", p.comm, ts.comm);
+                }
+                p.wchan = read_wchan(&format!("/proc/{}/task/{tid}/wchan", p.pid));
+                break;
+            }
+        }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn read_wchan(path: &str) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|w| w.trim().to_string())
+        .filter(|w| !w.is_empty() && w != "0")
 }
 
 #[cfg(not(target_os = "linux"))]
