@@ -431,3 +431,25 @@ fn a_probe_that_cannot_finish_counts_as_maybe_wedged() {
     assert_eq!(ev[0]["proc"]["probe"], "timeout");
     assert!(ev[0]["proc"]["blocked_for_s"].as_u64().is_some());
 }
+
+#[test]
+fn inherited_sighup_ignore_is_respected() {
+    // nohup: the caller ignores SIGHUP; a HUP must not kill the child.
+    use std::os::unix::process::CommandExt;
+    let e = Env::new();
+    let mut c = e.cmd();
+    c.args(["--no-s1", "-q", "--", "sh", "-c", "sleep 1; echo survived"])
+        .stdout(std::process::Stdio::piped());
+    unsafe {
+        c.pre_exec(|| {
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let child = c.spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    unsafe { libc::kill(child.id() as i32, libc::SIGHUP) };
+    let o = child.wait_with_output().unwrap();
+    assert!(o.status.success(), "{:?}", o.status);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("survived"));
+}

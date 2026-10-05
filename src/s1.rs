@@ -52,7 +52,7 @@ impl Client {
                 errors.push("budget exhausted".to_string());
                 break;
             }
-            if !self.breaker.allow(url) {
+            if !self.breaker.acquire(url) {
                 errors.push(format!("{url}: breaker open"));
                 continue;
             }
