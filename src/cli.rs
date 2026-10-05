@@ -25,7 +25,7 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
     if !v.is_finite() || v < 0.0 {
         return Err(format!("invalid duration {s:?}"));
     }
-    Ok(Duration::from_secs_f64(v * mult))
+    Duration::try_from_secs_f64(v * mult).map_err(|_| format!("duration {s:?} is out of range"))
 }
 
 #[derive(Debug, Parser)]
@@ -134,6 +134,7 @@ mod tests {
         assert_eq!(parse_duration("7").unwrap(), Duration::from_secs(7));
         assert!(parse_duration("-1s").is_err());
         assert!(parse_duration("soon").is_err());
+        assert!(parse_duration("1e20").is_err());
     }
 
     #[test]

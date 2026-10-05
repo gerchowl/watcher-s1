@@ -75,6 +75,7 @@ pub fn log(quiet: bool, msg: &str) {
 static SIG_PIPE_W: AtomicI32 = AtomicI32::new(-1);
 
 extern "C" fn on_signal(sig: libc::c_int) {
+    let saved = nix::errno::Errno::last_raw();
     let fd = SIG_PIPE_W.load(Ordering::Relaxed);
     if fd >= 0 {
         let b = sig as u8;
@@ -82,6 +83,7 @@ extern "C" fn on_signal(sig: libc::c_int) {
             libc::write(fd, &b as *const u8 as *const libc::c_void, 1);
         }
     }
+    nix::errno::Errno::set_raw(saved);
 }
 
 const FORWARDED: &[libc::c_int] = &[
@@ -103,6 +105,14 @@ fn install_signals() -> std::io::Result<OwnedFd> {
     std::mem::forget(w); // lives for the process
     for &s in FORWARDED.iter().chain(&[libc::SIGCHLD, libc::SIGWINCH]) {
         unsafe {
+            // An inherited SIG_IGN (nohup, `cmd &` in sh) is the caller's
+            // decision: keep ignoring it, and so never forward it. exec keeps
+            // SIG_IGN, so the child ignores it too, exactly as without us.
+            let mut old: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(s, std::ptr::null(), &mut old);
+            if old.sa_sigaction == libc::SIG_IGN && FORWARDED.contains(&s) {
+                continue;
+            }
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = on_signal as *const () as usize;
             sa.sa_flags = libc::SA_RESTART;
@@ -159,6 +169,10 @@ impl RawMode {
         let saved = termios::tcgetattr(fd).ok()?;
         let mut raw = saved.clone();
         termios::cfmakeraw(&mut raw);
+        // Raw input, but keep output processing: the child's "\n" (no CRLF
+        // on the PTY side) must still become "\r\n" on the real terminal,
+        // as must our own log and event lines.
+        raw.output_flags.insert(OutputFlags::OPOST | OutputFlags::ONLCR);
         termios::tcsetattr(fd, SetArg::TCSANOW, &raw).ok()?;
         Some(Self { saved })
     }
@@ -221,7 +235,19 @@ fn spawn(opts: &Options, run_id: &str, interactive: bool) -> std::io::Result<Spa
                 Ok(())
             });
         }
-        let mut child = cmd.spawn()?;
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                // exec failed after the child may already have taken the
+                // terminal: take it back, or the shell is stranded.
+                if take_tty {
+                    with_sigttou_ignored(|| unsafe {
+                        libc::tcsetpgrp(0, libc::getpgrp());
+                    });
+                }
+                return Err(e);
+            }
+        };
         let out: OwnedFd = child.stdout.take().expect("piped").into();
         let err: OwnedFd = child.stderr.take().expect("piped").into();
         for fd in [&out, &err] {
@@ -246,7 +272,7 @@ fn spawn(opts: &Options, run_id: &str, interactive: bool) -> std::io::Result<Spa
     unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
     // The child's "\n" reaches us as "\n" (no CRLF translation), so the
     // tee is byte-faithful for files and pipes; a terminal on our side
-    // does its own translation.
+    // translates it (RawMode keeps OPOST|ONLCR for exactly this).
     if let Ok(mut t) = termios::tcgetattr(&slave) {
         t.output_flags.remove(OutputFlags::ONLCR);
         if !interactive {
@@ -377,7 +403,10 @@ impl<'a> Watch<'a> {
             let (root, pgid) = (self.run.pid, self.run.pgid);
             self.prober.start(move || sample_tree(root, pgid));
         }
-        if let Some(s) = self.prober.poll() {
+        if let Some(s) = self.prober.poll()
+            && quiet >= self.opts.sample_every
+        {
+            // (A sample that lands after output resumed is stale: dropped.)
             self.on_sample(s, now);
         }
         if !self.blocked_emitted
@@ -484,7 +513,10 @@ impl<'a> Watch<'a> {
                 &format!("timeout after {:?}: SIGTERM to process group {}", limit, self.run.pgid),
             );
             let _ = kill(Pid::from_raw(-self.run.pgid), Signal::SIGTERM);
-            self.kill_at = Some(now + self.opts.kill_grace);
+            self.kill_at = Some(
+                now.checked_add(self.opts.kill_grace)
+                    .unwrap_or(now + Duration::from_secs(86400)),
+            );
         }
         if let Some(at) = self.kill_at
             && now >= at
@@ -520,6 +552,21 @@ fn write_all_fd(fd: RawFd, mut data: &[u8]) {
             unsafe { libc::poll(&mut p, 1, 100) };
         } else {
             return; // closed or broken: drop our copy, keep watching
+        }
+    }
+}
+
+/// Non-blocking write: bytes accepted (possibly 0), `None` if the fd is gone.
+fn write_some(fd: RawFd, data: &[u8]) -> Option<usize> {
+    loop {
+        let n = unsafe { libc::write(fd, data.as_ptr() as *const libc::c_void, data.len()) };
+        if n >= 0 {
+            return Some(n as usize);
+        }
+        match std::io::Error::last_os_error().kind() {
+            std::io::ErrorKind::Interrupted => continue,
+            std::io::ErrorKind::WouldBlock => return Some(0),
+            _ => return None,
         }
     }
 }
@@ -617,6 +664,10 @@ pub fn run(opts: Options) -> Outcome {
     let mut stdin_open = sp.input.is_some();
     let mut status = None;
     let mut drain_until: Option<Instant> = None;
+    // Forwarded keystrokes the PTY has not accepted yet. While non-empty we
+    // wait for POLLOUT on the master instead of reading more stdin, so a
+    // big paste can never block the loop (and with it the output drain).
+    let mut pending: Vec<u8> = Vec::new();
 
     loop {
         // Poll set: signal pipe, open outputs, stdin when forwarding.
@@ -634,14 +685,35 @@ pub fn run(opts: Options) -> Outcome {
                 });
             }
         }
-        if stdin_open && status.is_none() {
+        let stdin_slot = (stdin_open && status.is_none() && pending.is_empty()).then(|| {
             fds.push(libc::pollfd {
                 fd: 0,
                 events: libc::POLLIN,
                 revents: 0,
             });
-        }
+            fds.len() - 1
+        });
+        let pending_slot = match (sp.input, pending.is_empty()) {
+            (Some(input), false) => {
+                fds.push(libc::pollfd {
+                    fd: input,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                });
+                Some(fds.len() - 1)
+            }
+            _ => None,
+        };
         unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 100) };
+        // An output fd the kernel calls invalid would otherwise spin.
+        for (i, (fd, _)) in sp.outputs.iter().enumerate() {
+            if fds
+                .iter()
+                .any(|p| p.fd == fd.as_raw_fd() && p.revents & libc::POLLNVAL != 0)
+            {
+                open[i] = false;
+            }
+        }
 
         // Signals.
         let mut sb = [0u8; 64];
@@ -675,15 +747,30 @@ pub fn run(opts: Options) -> Outcome {
             }
         }
 
-        // Stdin forwarding (interactive PTY only).
-        if stdin_open
-            && status.is_none()
-            && let Some(input) = sp.input
+        // Stdin forwarding (interactive PTY only). Read ONLY when poll says
+        // stdin is ready: our tty stdin stays blocking (it is shared with
+        // the shell), and a blocking read here would freeze the loop.
+        if let (Some(slot), Some(_)) = (stdin_slot, sp.input) {
+            let re = fds[slot].revents;
+            if re & libc::POLLIN != 0 {
+                match read_some(0, &mut buf) {
+                    Some(0) => {}
+                    Some(n) => pending.extend_from_slice(&buf[..n]),
+                    None => stdin_open = false,
+                }
+            } else if re & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                stdin_open = false;
+            }
+        }
+        if let Some(input) = sp.input
+            && !pending.is_empty()
+            && (pending_slot.is_none_or(|i| fds[i].revents != 0))
         {
-            match read_some(0, &mut buf) {
-                Some(0) => {}
-                Some(n) => write_all_fd(input, &buf[..n]),
-                None => stdin_open = false,
+            match write_some(input, &pending) {
+                Some(n) => {
+                    pending.drain(..n);
+                }
+                None => pending.clear(), // the PTY is gone
             }
         }
 
