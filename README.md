@@ -72,8 +72,15 @@ inputs.watcher-s1.url = "github:gerchowl/watcher-s1";
 environment.systemPackages = [ inputs.watcher-s1.packages.${system}.default ];
 ```
 
-Or ad hoc: `nix run github:gerchowl/watcher-s1 -- -- make test`, or
-`cargo install --git https://github.com/gerchowl/watcher-s1`.
+Pin a release with `github:gerchowl/watcher-s1?ref=v0.1.0`.
+
+Without Nix:
+- **Release binaries:** every GitHub Release carries
+  `watcher-s1-<tag>-<target>.tar.gz` plus `.sha256`, for
+  `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` (fully static,
+  any distribution) and `aarch64-apple-darwin`.
+- **crates.io:** `cargo install watcher-s1`.
+- **Ad hoc:** `nix run github:gerchowl/watcher-s1 -- -- make test`.
 
 ## Usage
 
@@ -310,6 +317,26 @@ The real-endpoint tests (`tests/kev.rs`) only run when the test-only
 `SYSTEMONE_URL` does not trigger them),
 and they make their calls strictly one after another. The host is wedge-prone, so
 never parallelise them.
+
+## Releasing
+
+Releases go through the [vig-os/devkit](https://github.com/vig-os/devkit)
+release train ([`docs/DOWNSTREAM_RELEASE.md`](docs/DOWNSTREAM_RELEASE.md)),
+with tags `vX.Y.Z`:
+
+```bash
+gh workflow run prepare-release.yml -f version=X.Y.Z          # cut release/X.Y.Z from main
+gh workflow run release.yml --ref release/X.Y.Z -f version=X.Y.Z -f release-kind=final -f dry-run=false
+gh workflow run promote-release.yml --ref release/X.Y.Z -f version=X.Y.Z
+```
+
+`release.yml` tags the release and creates a **draft** GitHub Release.
+`release-binaries.yml` builds the binaries into that draft, and
+`promote-release.yml` publishes it and merges the release branch back to
+`main`. Publishing fires `publish-release-extension.yml`, which runs
+`cargo publish` to crates.io. That step is a no-op until the
+`CARGO_REGISTRY_TOKEN` secret exists. The train needs the `COMMIT_APP_*` and
+`RELEASE_APP_*` GitHub App secrets.
 
 ## License
 
