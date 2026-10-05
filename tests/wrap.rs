@@ -757,3 +757,32 @@ fn every_byte_arrives_behind_a_slow_reader() {
     assert!(child.wait().unwrap().success());
     assert_eq!(total, 5_242_880 + 40_000, "output lost");
 }
+
+#[test]
+fn a_grandchild_writing_forever_does_not_keep_us_alive() {
+    let e = Env::new();
+    let mut c = e.cmd();
+    c.args([
+        "--no-s1",
+        "-q",
+        "--pipe",
+        "--silence",
+        "0",
+        "--",
+        "sh",
+        "-c",
+        "yes > /dev/stdout & exit 0",
+    ])
+    .stdout(std::process::Stdio::piped());
+    let t0 = std::time::Instant::now();
+    let mut child = c.spawn().unwrap();
+    let mut out = child.stdout.take().unwrap();
+    // Keep reading so backpressure is not what stops us.
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 65536];
+        while matches!(std::io::Read::read(&mut out, &mut buf), Ok(n) if n > 0) {}
+    });
+    let st = child.wait().unwrap();
+    assert!(st.success());
+    assert!(t0.elapsed() < Duration::from_secs(8), "{:?}", t0.elapsed());
+}
