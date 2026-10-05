@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/gerchowl/watcher-s1/blob/main/event.schema.json",
+  "title": "watcher-s1 event",
+  "description": "One sideband event from watcher-s1, emitted as one JSON object per line. Schema 1. Consumers must ignore unknown fields; new optional fields may be added within schema 1, and a breaking change bumps `schema`.",
+  "type": "object",
+  "required": [
+    "schema", "ts", "host", "source", "run_id", "cmd", "pid", "pgid", "state", "reason",
+    "exit", "severity", "dedup_key", "caused_by", "evidence_tail", "s1"
+  ],
+  "properties": {
+    "schema": { "const": 1 },
+    "ts": { "type": "string", "format": "date-time", "description": "UTC, RFC 3339 with milliseconds." },
+    "host": { "type": "string", "description": "Short hostname of the watcher." },
+    "source": { "const": "watcher-s1" },
+    "run_id": {
+      "type": "string",
+      "description": "<host>:<watcher pid>:<start unix ms>. Exported to the child as WATCHER_S1_PARENT, so a nested watcher's `caused_by` names this run."
+    },
+    "cmd": { "type": "string", "description": "The wrapped argv, shell-quoted." },
+    "pid": { "type": "integer", "description": "The wrapped child's pid." },
+    "pgid": { "type": "integer", "description": "The child's process group (== pid: the child leads its own group)." },
+    "state": {
+      "enum": ["progressing", "stalled", "waiting_on_input", "failing", "done"],
+      "description": "progressing: output resumed after a stall. stalled: silence threshold or a blocked (D/U) process. waiting_on_input: an unanswered prompt. failing: non-zero exit, death by signal, timeout kill, or System One flags the output. done: exit 0 and nothing flags it."
+    },
+    "reason": {
+      "enum": ["exit", "signal", "timeout", "silence", "blocked", "prompt", "resumed", "masked_failure"],
+      "description": "What triggered this event."
+    },
+    "exit": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["code", "signal"],
+          "properties": {
+            "code": { "type": ["integer", "null"] },
+            "signal": { "type": ["integer", "null"] }
+          },
+          "additionalProperties": false
+        }
+      ],
+      "description": "Set only on the final event. Exactly one of code/signal is non-null."
+    },
+    "severity": { "enum": ["info", "warn", "error"] },
+    "dedup_key": {
+      "type": "string",
+      "pattern": "^watcher-s1:[^:]+:[a-z_]+:[0-9a-f]{16}$",
+      "description": "watcher-s1:<host>:<state>:<fnv1a64(cmd)>; stable across runs of the same command."
+    },
+    "caused_by": { "type": ["string", "null"], "description": "The parent watcher's run_id (from WATCHER_S1_PARENT), or null." },
+    "evidence_tail": { "type": "string", "description": "The last lines of output, ANSI stripped." },
+    "s1": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["endpoint", "failing", "clean_done", "fused", "latency_ms"],
+          "properties": {
+            "endpoint": { "type": "string" },
+            "failing": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+            "clean_done": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+            "fused": { "type": "number", "minimum": 0, "maximum": 1 },
+            "latency_ms": { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": false
+        }
+      ],
+      "description": "System One verdict, or null when the tier is off, was not consulted, or failed open."
+    },
+    "proc": {
+      "type": "object",
+      "required": ["probe", "blocked", "blocked_for_s"],
+      "properties": {
+        "probe": { "enum": ["ok", "timeout", "error"], "description": "timeout: the probe itself hung (state unknown, maybe wedged)." },
+        "blocked": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["pid", "state", "wchan", "comm"],
+            "properties": {
+              "pid": { "type": "integer" },
+              "state": { "type": "string" },
+              "wchan": { "type": ["string", "null"] },
+              "comm": { "type": "string" }
+            },
+            "additionalProperties": false
+          }
+        },
+        "blocked_for_s": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false,
+      "description": "Optional. The latest process-state sample of the child's process group."
+    },
+    "prompt": { "type": "string", "description": "Optional. The prompt line, on waiting_on_input." }
+  },
+  "additionalProperties": true
+}

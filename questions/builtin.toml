@@ -1,0 +1,33 @@
+# watcher-s1 built-in System One question set.
+#
+# This file is DATA, not code: the binary embeds it as the `builtin` set, and a
+# config can point `[systemone] questions = "/path/to/file.toml"` at a copy
+# with the same shape. goal-s1 and other clients can read the same file.
+#
+# Measured on 387 labelled fleet logs (g-fleet#244, task a, 4 KB tail, exit
+# status hidden): fused AUC 0.93, P@R80 0.89; on piped exit-0 agent commands
+# fused >= 0.8 flagged 5/5 genuine failures. Changing the wording changes the
+# answers: re-measure before editing.
+
+# A fused score at or above this flags the output as an unrecovered failure.
+threshold = 0.8
+
+# How much of the output tail goes into the state, in bytes.
+tail_bytes = 4096
+
+# fused = mean( p(q) for q in positive  ++  1 - p(q) for q in negative )
+[score]
+positive = ["failing"]
+negative = ["clean_done"]
+
+[questions.failing]
+type = "noul"
+instructions = "Does the output show an error that the process did not recover from?"
+criteria.true = "an error, crash, failed step or failed test that is not followed by a successful retry"
+criteria.false = "no errors, or only warnings, expected test noise, or errors that were retried successfully"
+
+[questions.clean_done]
+type = "noul"
+instructions = "Did the process reach a clean, successful end?"
+criteria.true = "the output ends with the work completed and nothing left broken"
+criteria.false = "the output ends mid-work, or with something broken or unfinished"
