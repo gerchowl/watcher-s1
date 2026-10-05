@@ -144,7 +144,7 @@ DEVKIT_COMMIT_APP_ENVIRONMENT=
 # DEVKIT_SYNC_TARGET mirror's only fold-back to the trunk (#1758). Governs
 # scaffold SHAPE only, not the flake — an unknown name aborts the scaffold
 # loudly (#1284).
-DEVKIT_FEATURES_DISABLED=
+DEVKIT_FEATURES_DISABLED=release,sync-issues,skills,worktree,gh-templates
 
 # License the scaffold ships: apache-2.0 (default) | proprietary | none. Empty
 # (= unset) resolves to `apache-2.0` — the shipped Apache-2.0 template, adding
@@ -168,7 +168,7 @@ DEVKIT_LICENSE=
 # anchored render of the hook arg + resolve-toolchain's `refs-optional-types`
 # output); written back only for a non-default value (#1282). Sugar over
 # DEVKIT_REFS_OPTIONAL_TYPES below, which WINS when both are set (#1633).
-DEVKIT_REFS_POLICY=
+DEVKIT_REFS_POLICY=optional
 
 # Approved commit types for the commit-message gate — a comma-separated
 # (whitespace-tolerant) FULL REPLACEMENT list driving the validate-commit-msg
