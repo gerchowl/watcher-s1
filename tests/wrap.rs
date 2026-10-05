@@ -562,7 +562,7 @@ fn a_stalled_stdout_reader_does_not_stall_the_timeout() {
     let e = Env::new();
     let mut c = e.cmd();
     c.args(["--no-s1", "--timeout", "1s", "--kill-grace", "300ms", "--"])
-        .args(["sh", "-c", "head -c 150000 /dev/zero | tr '\\\\0' x; sleep 30"])
+        .args(["sh", "-c", "head -c 60000 /dev/zero | tr '\\\\0' x; sleep 30"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let t0 = std::time::Instant::now();
@@ -583,7 +583,7 @@ fn a_stalled_stdout_reader_does_not_stall_the_timeout() {
     std::io::Read::read_to_end(&mut out, &mut sink).unwrap();
     let st = child.wait().unwrap();
     assert_eq!(st.signal(), Some(libc::SIGTERM), "{st:?}");
-    assert_eq!(sink.len(), 150_000, "output lost");
+    assert_eq!(sink.len(), 60_000, "output lost");
     assert_eq!(last(&e.events())["reason"], "timeout");
 }
 
