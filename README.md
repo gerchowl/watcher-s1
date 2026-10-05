@@ -29,7 +29,9 @@ hours, no dedupe windows. It emits events with a `severity` and a stable
 `dedup_key`; a separate gateway
 ([g-fleet#188](https://github.com/gerchowl/g-fleet/issues/188)) decides what
 reaches a human. It also doesn't attach to running processes (`--pid`): v1
-only wraps (`watcher-s1 -- cmd`), and it never answers a prompt for you.
+only wraps (`watcher-s1 -- cmd`) or passively follows a log file
+(`--log FILE`), and it never answers a prompt for you: at most it cancels one
+(`--on-prompt cancel`).
 
 ### Guarantees
 
@@ -51,6 +53,10 @@ only wraps (`watcher-s1 -- cmd`), and it never answers a prompt for you.
 - **Bounded probes.** Every external probe (process sampling, DNS, HTTP to
   System One) runs under a wall-clock timeout. A probe that times out counts as
   "state unknown, maybe wedged". `/nix/store` is never stat'ed.
+- **Your stdout never stalls the watch.** Output goes to stdout through a
+  writer thread and a bounded queue. If whoever reads it stops, the child is
+  back-pressured but the timers (`--silence`, `--timeout`, prompt cancel) keep
+  running.
 - **Fail open.** If System One is not configured, down or slow, the event
   carries `"s1": null` and everything else works.
 
@@ -85,12 +91,25 @@ watcher-s1 judge --posttooluse [--s1-url URL] ...   # Claude Code hook, see belo
 | `--sample-every DUR` | `10s` | process-state sampling interval while quiet |
 | `--blocked-after DUR` | `60s` | a tree blocked in `D`/`U` (or unprobeable) this long raises `stalled` |
 | `--probe-timeout DUR` | `2s` | wall-clock limit for one process-state probe |
+| `--on-prompt wait\|cancel` | `wait` | `cancel`: an unanswered prompt gets SIGINT after `--prompt-cancel-after`, then TERM and KILL with `--kill-grace` between (final event `reason: prompt_cancelled`) |
+| `--prompt-cancel-after DUR` | `60s` | how long a prompt may wait before `cancel` acts |
+| `--log FILE` | — | passive mode, see below (instead of `-- CMD`) |
 | `--evidence-bytes N` | `1500` | output tail carried in each event |
 | `--events FILE` | — | append events as JSON lines to FILE |
 | `--events-fd N` | — | write events as JSON lines to an inherited fd |
 | *(neither)* | stderr | one line per event, prefixed `watcher-s1: ` |
 | `-q, --quiet` | off | drop the `watcher-s1 (log): …` diagnostics (events still flow) |
 | `--s1-url URL`, `--s1-timeout SECS`, `--config FILE`, `--no-s1` | — | System One, see below |
+
+### Passive mode: `--log FILE`
+
+`watcher-s1 --log /var/log/job.log --silence 10m` follows a growing file
+instead of running anything. Silence, prompts and the System One silence
+judgement work as in wrap mode; there is no process to sample, no exit and
+no final event, and nothing is teed. The file is followed across truncation
+and rotation (a new file at the same path). It runs until SIGINT/SIGTERM/
+SIGHUP/SIGQUIT and leaves by that signal. Events carry `pid: 0` and
+`cmd: "--log <path>"`.
 
 Durations take `250ms`, `30s`, `5m`, `2h` or bare seconds. `watcher-s1`'s own
 usage errors exit `2`; a command that cannot be found exits `127` (not
@@ -120,13 +139,14 @@ must ignore unknown fields).
 | `state` | `reason` | `severity` | Emitted when |
 |---|---|---|---|
 | `stalled` | `silence` | warn | no output for `--silence` |
-| `stalled` | `blocked` | warn | the tree sat in `D`/`U` state, or the probe hung, for `--blocked-after` (adds `proc`) |
+| `stalled` | `blocked` | warn | a process (or any of its threads) sat in `D`/`U` state, or the probe hung, for `--blocked-after` (adds `proc`) |
 | `waiting_on_input` | `prompt` | warn | the last line is an unanswered prompt (adds `prompt`) |
 | `failing` | `silence` | warn | silence, and System One reads the tail as an unrecovered failure |
 | `progressing` | `resumed` | info | output resumed after a warn event |
 | `done` | `exit` | info | exit 0 and nothing flags it (final event) |
 | `failing` | `masked_failure` | warn | exit 0, but System One's fused score ≥ threshold (final event) |
 | `failing` | `exit` / `signal` / `timeout` | error | non-zero exit, death by signal, or killed by `--timeout` (final event) |
+| `failing` | `prompt_cancelled` | error | `--on-prompt cancel` cancelled an unanswered prompt (final event) |
 
 Every run ends with exactly one final event (`exit` non-null).
 
@@ -169,8 +189,9 @@ questions = "builtin"                           # or a path to a question file
   overrides), so it holds across processes: after `fails` consecutive
   failures an endpoint is skipped for `cooldown_s`, then one call is let
   through.
-- The host is resolved once per process, under the deadline. Only `http://`
-  URLs are supported (System One lives on the tailnet; no TLS stack).
+- The host is resolved once per process, under the deadline. `http://` and
+  `https://` are supported; TLS is rustls, trusting the bundled Mozilla roots
+  plus any PEM bundle in `SSL_CERT_FILE` (for a private CA).
 
 ### Questions
 

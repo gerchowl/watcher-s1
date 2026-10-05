@@ -25,7 +25,7 @@
       "description": "progressing: output resumed after a stall. stalled: silence threshold or a blocked (D/U) process. waiting_on_input: an unanswered prompt. failing: non-zero exit, death by signal, timeout kill, or System One flags the output. done: exit 0 and nothing flags it."
     },
     "reason": {
-      "enum": ["exit", "signal", "timeout", "silence", "blocked", "prompt", "resumed", "masked_failure"],
+      "enum": ["exit", "signal", "timeout", "prompt_cancelled", "silence", "blocked", "prompt", "resumed", "masked_failure"],
       "description": "What triggered this event."
     },
     "exit": {
