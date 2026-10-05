@@ -787,6 +787,9 @@ pub fn run(opts: Options) -> Outcome {
     let mut stdin_open = sp.input.is_some();
     let mut status = None;
     let mut drain_until: Option<Instant> = None;
+    // Hard stop for the drain: a grandchild that keeps writing after the
+    // leader exited (`sh -c 'yes &'`) must not keep us alive forever.
+    let mut drain_cap: Option<Instant> = None;
     // Forwarded keystrokes the PTY has not accepted yet. While non-empty we
     // wait for POLLOUT on the master instead of reading more stdin, so a
     // big paste can never block the loop (and with it the output drain).
@@ -933,6 +936,7 @@ pub fn run(opts: Options) -> Outcome {
                 status = Some(st);
                 // Grandchildren may hold the output open: drain briefly.
                 drain_until = Some(now + Duration::from_millis(300));
+                drain_cap = Some(now + Duration::from_secs(3));
             } else {
                 w.enforce_timeout(now);
                 w.tick(now);
@@ -942,7 +946,9 @@ pub fn run(opts: Options) -> Outcome {
         // is over AND a full read pass found nothing: bytes already in the
         // pipes are always teed, however slow our reader is.
         if status.is_some()
-            && (open.iter().all(|o| !o) || (drain_until.is_some_and(|d| now >= d) && !got_output && held.is_none()))
+            && (open.iter().all(|o| !o)
+                || (drain_until.is_some_and(|d| now >= d) && !got_output && held.is_none())
+                || drain_cap.is_some_and(|d| now >= d))
         {
             break;
         }
