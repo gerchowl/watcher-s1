@@ -518,41 +518,12 @@ fn a_really_blocked_process_raises_stalled_blocked() {
     );
 }
 
-#[cfg(target_os = "macos")]
-#[test]
-fn a_really_blocked_process_raises_stalled_blocked_on_darwin() {
-    let e = Env::new();
-    let me = std::env::current_exe().unwrap();
-    let r = run({
-        let mut c = e.cmd();
-        c.env("WATCHER_S1_VFORK_HOLD", "4")
-            .args([
-                "--no-s1",
-                "-q",
-                "--sample-every",
-                "300ms",
-                "--blocked-after",
-                "800ms",
-                "--silence",
-                "0",
-                "--",
-            ])
-            .arg(me)
-            .args(["--exact", "helper_vfork_hold", "--test-threads=1", "-q"]);
-        c
-    });
-    assert!(r.status.success(), "{:?} {}", r.status, r.stderr);
-    let ev = e.events();
-    let blocked = ev
-        .iter()
-        .find(|x| x["reason"] == "blocked")
-        .unwrap_or_else(|| panic!("{ev:?}"));
-    let procs = blocked["proc"]["blocked"].as_array().unwrap();
-    assert!(
-        procs.iter().any(|p| p["state"].as_str().unwrap().starts_with('U')),
-        "{procs:?}"
-    );
-}
+// No darwin twin of the test above: macOS returns from vfork without leaving
+// the parent in uninterruptible (`U`) wait (measured on GitHub's macos-26
+// runner: the helper finished in 0.00 s), and nothing else in user space can
+// put a process there on demand. The darwin side is covered by the `ps`
+// parser unit test and by the probe-timeout path
+// (`a_probe_that_cannot_finish_counts_as_maybe_wedged`).
 
 #[test]
 fn a_stalled_stdout_reader_does_not_stall_the_timeout() {
