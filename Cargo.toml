@@ -12,12 +12,15 @@ clap = { version = "4.6.7", features = ["derive"] }
 libc = "0.2.190"
 nix = { version = "0.31.3", features = ["process", "signal", "term", "poll", "fs", "resource", "hostname", "ioctl"] }
 regex = "1.13.1"
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
 toml = { version = "1.1.6", features = ["preserve_order"] }
+webpki-roots = "1.0.9"
 
 [dev-dependencies]
 jsonschema = { version = "0.58.5", default-features = false }
+rcgen = "0.14.10"
 tempfile = "3.27.0"
 
 [profile.release]

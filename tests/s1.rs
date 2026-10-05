@@ -385,3 +385,142 @@ fn judge_survives_garbage_input() {
     assert!(o.status.success());
     assert!(o.stdout.is_empty());
 }
+
+// --- https -------------------------------------------------------------------
+
+/// A one-shot TLS System One on localhost with a fresh self-signed cert.
+/// Returns (url, path of the cert PEM to trust via SSL_CERT_FILE).
+fn tls_fake(e: &Env, reply_body: &'static str, hang: bool) -> (String, std::path::PathBuf) {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use std::io::{Read, Write};
+    let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let pem = e.path("ca.pem");
+    std::fs::write(&pem, ck.cert.pem()).unwrap();
+    let certs = vec![CertificateDer::from(ck.cert.der().to_vec())];
+    let key = PrivateKeyDer::try_from(ck.signing_key.serialize_der()).unwrap();
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let cfg = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+    let cfg = std::sync::Arc::new(cfg);
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("https://localhost:{}/v1/systemone", l.local_addr().unwrap().port());
+    std::thread::spawn(move || {
+        for s in l.incoming().flatten() {
+            if hang {
+                std::thread::sleep(Duration::from_secs(30));
+                drop(s);
+                continue;
+            }
+            let conn = rustls::ServerConnection::new(cfg.clone()).unwrap();
+            let mut tls = rustls::StreamOwned::new(conn, s);
+            let mut req = Vec::new();
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = tls.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&buf[..n]);
+                if let Some(h) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&req[..h]).to_ascii_lowercase();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0)))
+                        .unwrap_or(0);
+                    if req.len() >= h + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{reply_body}",
+                reply_body.len()
+            );
+            let _ = tls.write_all(resp.as_bytes());
+            let _ = tls.flush();
+            tls.conn.send_close_notify();
+            let _ = tls.flush();
+        }
+    });
+    (url, pem)
+}
+
+const FAILING_ANSWERS: &str =
+    r#"{"answers":{"failing":{"type":"noul","noul":0.9},"clean_done":{"type":"noul","noul":0.1}}}"#;
+
+#[test]
+fn https_endpoint_with_a_trusted_private_ca() {
+    let e = Env::new();
+    let (url, pem) = tls_fake(&e, FAILING_ANSWERS, false);
+    let r = run({
+        let mut c = e.cmd();
+        c.env("SSL_CERT_FILE", &pem).args([
+            "-q",
+            "--silence",
+            "0",
+            "--s1-url",
+            &url,
+            "--",
+            "sh",
+            "-c",
+            "echo 'error: x'; exit 1",
+        ]);
+        c
+    });
+    assert_eq!(r.status.code(), Some(1));
+    let f = last(&e.events()).clone();
+    assert_eq!(f["s1"]["endpoint"], url, "{f}");
+    assert!((f["s1"]["fused"].as_f64().unwrap() - 0.9).abs() < 1e-9);
+}
+
+#[test]
+fn https_with_an_untrusted_cert_fails_open() {
+    let e = Env::new();
+    let (url, _pem) = tls_fake(&e, FAILING_ANSWERS, false);
+    let r = run({
+        let mut c = e.cmd();
+        c.env_remove("SSL_CERT_FILE").args([
+            "-q",
+            "--silence",
+            "0",
+            "--s1-url",
+            &url,
+            "--",
+            "sh",
+            "-c",
+            "echo 'error: x'; exit 1",
+        ]);
+        c
+    });
+    assert_eq!(r.status.code(), Some(1));
+    assert_eq!(last(&e.events())["s1"], Value::Null);
+}
+
+#[test]
+fn a_hung_tls_handshake_respects_the_deadline() {
+    let e = Env::new();
+    let (url, pem) = tls_fake(&e, FAILING_ANSWERS, true);
+    let r = run({
+        let mut c = e.cmd();
+        c.env("SSL_CERT_FILE", &pem).args([
+            "-q",
+            "--silence",
+            "0",
+            "--s1-url",
+            &url,
+            "--s1-timeout",
+            "0.5",
+            "--",
+            "sh",
+            "-c",
+            "echo 'error: x'; exit 1",
+        ]);
+        c
+    });
+    assert_eq!(r.status.code(), Some(1));
+    assert!(r.elapsed < Duration::from_secs(3), "{:?}", r.elapsed);
+    assert_eq!(last(&e.events())["s1"], Value::Null);
+}

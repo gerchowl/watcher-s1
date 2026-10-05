@@ -34,6 +34,9 @@ pub struct Options {
     /// A blocked (D/U) or unprobeable tree this long raises `stalled`.
     pub blocked_after: Duration,
     pub probe_timeout: Duration,
+    /// Cancel an unanswered prompt after this long (SIGINT, then TERM and
+    /// KILL with `kill_grace` between); `None` = only report it.
+    pub prompt_cancel: Option<Duration>,
     pub evidence_bytes: usize,
     pub s1: Option<Arc<Client>>,
     pub sink: Sink,
@@ -336,9 +339,43 @@ struct Watch<'a> {
     pending_stall: Option<(Receiver<Result<Verdict, String>>, Event)>,
     timeout_fired: bool,
     kill_at: Option<Instant>,
+    prompt_since: Option<Instant>,
+    cancel_fired: bool,
+    term_at: Option<Instant>,
 }
 
 impl<'a> Watch<'a> {
+    fn new(opts: &'a Options, run: RunInfo) -> Self {
+        let now = Instant::now();
+        Watch {
+            opts,
+            run,
+            ring: Ring::new(ring::DEFAULT_CAPACITY),
+            start: now,
+            last_output: now,
+            episode_warned: false,
+            stall_done: false,
+            prompt_checked: false,
+            prompt_emitted: None,
+            blocked_emitted: false,
+            prober: Prober::new(opts.probe_timeout),
+            last_sample_at: None,
+            blocked_since: None,
+            last_proc: None,
+            pending_stall: None,
+            timeout_fired: false,
+            kill_at: None,
+            prompt_since: None,
+            cancel_fired: false,
+            term_at: None,
+        }
+    }
+
+    /// Did we (timeout or prompt cancel) kill the group?
+    fn we_killed(&self) -> bool {
+        self.timeout_fired || self.cancel_fired
+    }
+
     fn evidence(&self) -> String {
         ring::tail(&self.ring.text(), self.opts.evidence_bytes).to_string()
     }
@@ -363,6 +400,7 @@ impl<'a> Watch<'a> {
         self.stall_done = false;
         self.prompt_checked = false;
         self.prompt_emitted = None;
+        self.prompt_since = None;
         self.blocked_emitted = false;
         self.blocked_since = None;
         self.last_sample_at = None;
@@ -390,11 +428,33 @@ impl<'a> Watch<'a> {
                 ev.prompt = Some(p.clone());
                 self.emit(&ev);
                 self.prompt_emitted = Some(p);
+                self.prompt_since = Some(now);
             }
         }
 
+        // --on-prompt cancel: an unanswered prompt is cancelled, never
+        // answered. SIGINT first (what a person's Ctrl-C would do), then the
+        // TERM/KILL escalation.
+        if let (Some(after), Some(since)) = (self.opts.prompt_cancel, self.prompt_since)
+            && !self.cancel_fired
+            && self.run.pgid > 0
+            && now.duration_since(since) >= after
+        {
+            self.cancel_fired = true;
+            log(
+                self.opts.quiet,
+                &format!(
+                    "prompt unanswered for {after:?}: SIGINT to process group {}",
+                    self.run.pgid
+                ),
+            );
+            let _ = kill(Pid::from_raw(-self.run.pgid), Signal::SIGINT);
+            self.term_at = Some(later(now, self.opts.kill_grace));
+        }
+
         // Tier 0: process-state sampler while quiet.
-        if quiet >= self.opts.sample_every
+        if self.run.pid > 0
+            && quiet >= self.opts.sample_every
             && self
                 .last_sample_at
                 .is_none_or(|t| now.duration_since(t) >= self.opts.sample_every)
@@ -513,10 +573,18 @@ impl<'a> Watch<'a> {
                 &format!("timeout after {:?}: SIGTERM to process group {}", limit, self.run.pgid),
             );
             let _ = kill(Pid::from_raw(-self.run.pgid), Signal::SIGTERM);
-            self.kill_at = Some(
-                now.checked_add(self.opts.kill_grace)
-                    .unwrap_or(now + Duration::from_secs(86400)),
+            self.kill_at = Some(later(now, self.opts.kill_grace));
+        }
+        if let Some(at) = self.term_at
+            && now >= at
+        {
+            self.term_at = None;
+            log(
+                self.opts.quiet,
+                &format!("still running: SIGTERM to process group {}", self.run.pgid),
             );
+            let _ = kill(Pid::from_raw(-self.run.pgid), Signal::SIGTERM);
+            self.kill_at = Some(later(now, self.opts.kill_grace));
         }
         if let Some(at) = self.kill_at
             && now >= at
@@ -529,6 +597,73 @@ impl<'a> Watch<'a> {
             let _ = kill(Pid::from_raw(-self.run.pgid), Signal::SIGKILL);
         }
     }
+}
+
+/// The writer thread for our own stdout/stderr, behind a bounded queue
+/// (64 chunks of at most 64 KiB).
+struct Tee {
+    tx: mpsc::SyncSender<(RawFd, Vec<u8>)>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+impl Tee {
+    fn start() -> Self {
+        let (tx, rx) = mpsc::sync_channel::<(RawFd, Vec<u8>)>(64);
+        let handle = std::thread::spawn(move || {
+            for (fd, data) in rx {
+                write_all_fd(fd, &data);
+            }
+        });
+        Tee { tx, handle }
+    }
+
+    /// Queue without blocking; a full queue hands the chunk back.
+    fn try_send(&self, chunk: (RawFd, Vec<u8>)) -> Result<(), (RawFd, Vec<u8>)> {
+        match self.tx.try_send(chunk) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(c)) => Err(c),
+            Err(mpsc::TrySendError::Disconnected(_)) => Ok(()), // writer gone: drop
+        }
+    }
+
+    fn send(&self, chunk: (RawFd, Vec<u8>)) {
+        let _ = self.tx.send(chunk);
+    }
+
+    /// Flush everything queued (like a process blocking on its last write).
+    fn finish(self) {
+        drop(self.tx);
+        let _ = self.handle.join();
+    }
+}
+
+/// Has `pid` exited? Looks without reaping (WNOWAIT), so the zombie keeps its
+/// pid, and with it the process group id, reserved until we decide to reap.
+fn exited_unreaped(pid: i32) -> bool {
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let r = libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        );
+        r == 0 && siginfo_pid(&info) != 0
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn siginfo_pid(i: &libc::siginfo_t) -> libc::pid_t {
+    unsafe { i.si_pid() }
+}
+
+#[cfg(not(target_os = "linux"))]
+unsafe fn siginfo_pid(i: &libc::siginfo_t) -> libc::pid_t {
+    i.si_pid
+}
+
+fn later(now: Instant, d: Duration) -> Instant {
+    now.checked_add(d).unwrap_or(now + Duration::from_secs(86400))
 }
 
 /// The whole-call budget for one System One judgement.
@@ -638,26 +773,13 @@ pub fn run(opts: Options) -> Outcome {
     run.pgid = pid;
     let raw = if interactive { RawMode::enter() } else { None };
 
-    let now = Instant::now();
-    let mut w = Watch {
-        opts: &opts,
-        run,
-        ring: Ring::new(ring::DEFAULT_CAPACITY),
-        start: now,
-        last_output: now,
-        episode_warned: false,
-        stall_done: false,
-        prompt_checked: false,
-        prompt_emitted: None,
-        blocked_emitted: false,
-        prober: Prober::new(opts.probe_timeout),
-        last_sample_at: None,
-        blocked_since: None,
-        last_proc: None,
-        pending_stall: None,
-        timeout_fired: false,
-        kill_at: None,
-    };
+    let mut w = Watch::new(&opts, run);
+    // Our own stdout/stderr are written by a separate thread, so a stalled
+    // reader downstream can never stall the timers (--timeout included).
+    let tee = Tee::start();
+    // A chunk the writer queue had no room for: we stop reading the child
+    // (natural backpressure) until it fits, but keep ticking.
+    let mut held: Option<(RawFd, Vec<u8>)> = None;
 
     let mut buf = vec![0u8; 64 * 1024];
     let mut open: Vec<bool> = sp.outputs.iter().map(|_| true).collect();
@@ -670,14 +792,18 @@ pub fn run(opts: Options) -> Outcome {
     let mut pending: Vec<u8> = Vec::new();
 
     loop {
-        // Poll set: signal pipe, open outputs, stdin when forwarding.
+        if let Some(h) = held.take() {
+            held = tee.try_send(h).err();
+        }
+        // Poll set: signal pipe, open outputs (unless backpressured), stdin
+        // when forwarding.
         let mut fds = vec![libc::pollfd {
             fd: sig_r.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         }];
         for (i, (fd, _)) in sp.outputs.iter().enumerate() {
-            if open[i] {
+            if open[i] && held.is_none() {
                 fds.push(libc::pollfd {
                     fd: fd.as_raw_fd(),
                     events: libc::POLLIN,
@@ -733,14 +859,18 @@ pub fn run(opts: Options) -> Outcome {
             }
         }
 
-        // Output: tee through unchanged, then into the ring.
-        for (i, (fd, is_err)) in sp.outputs.iter().enumerate() {
-            while open[i] {
+        // Output: into the ring, and to the writer to tee through unchanged.
+        'outputs: for (i, (fd, is_err)) in sp.outputs.iter().enumerate() {
+            while open[i] && held.is_none() {
                 match read_some(fd.as_raw_fd(), &mut buf) {
                     Some(0) => break,
                     Some(n) => {
-                        write_all_fd(if *is_err { 2 } else { 1 }, &buf[..n]);
                         w.on_output(&buf[..n]);
+                        let chunk = (if *is_err { 2 } else { 1 }, buf[..n].to_vec());
+                        if let Err(back) = tee.try_send(chunk) {
+                            held = Some(back);
+                            break 'outputs;
+                        }
                     }
                     None => open[i] = false,
                 }
@@ -776,7 +906,17 @@ pub fn run(opts: Options) -> Outcome {
 
         let now = Instant::now();
         if status.is_none() {
-            if let Ok(Some(st)) = sp.child.try_wait() {
+            if exited_unreaped(pid) {
+                // The leader is a zombie: its pid, and so the group id, cannot
+                // be reused until we reap it. Kill what we started killing
+                // NOW, before the reap, so the signal cannot reach a stranger.
+                if w.we_killed() {
+                    let _ = kill(Pid::from_raw(-pid), Signal::SIGKILL);
+                }
+                let st = match sp.child.wait() {
+                    Ok(st) => st,
+                    Err(_) => break,
+                };
                 status = Some(st);
                 // Grandchildren may hold the output open: drain briefly.
                 drain_until = Some(now + Duration::from_millis(300));
@@ -790,11 +930,14 @@ pub fn run(opts: Options) -> Outcome {
         }
     }
 
-    let st = status.expect("loop exits only after the child");
-    if w.timeout_fired {
-        // The whole group goes, grandchildren included.
-        let _ = kill(Pid::from_raw(-w.run.pgid), Signal::SIGKILL);
+    if let Some(h) = held.take() {
+        tee.send(h);
     }
+    tee.finish();
+    let Some(st) = status else {
+        log(opts.quiet, "lost the child's exit status");
+        return Outcome::Code(1);
+    };
     let outcome = match (st.code(), st.signal()) {
         (Some(c), _) => Outcome::Code(c),
         (None, Some(s)) => Outcome::Signal(s),
@@ -811,11 +954,100 @@ pub fn run(opts: Options) -> Outcome {
     outcome
 }
 
+/// Passive mode: watch a growing log file (no child, no exit). Silence,
+/// prompts and the System One silence judgement work as in wrap mode; the
+/// process sampler has no tree to sample. The file is followed across
+/// truncation and rotation (a new inode at the same path). Nothing is
+/// teed. Runs until INT/TERM/HUP/QUIT, then leaves by that signal.
+pub fn run_log(opts: Options, path: &std::path::Path) -> Outcome {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::MetadataExt;
+
+    let sig_r = match install_signals() {
+        Ok(r) => r,
+        Err(e) => {
+            log(opts.quiet, &format!("cannot install signal handlers: {e}"));
+            return Outcome::Code(125);
+        }
+    };
+    let mut run = make_run_info(&[], 0);
+    run.cmd = format!("--log {}", path.display());
+    run.pgid = 0;
+    let mut w = Watch::new(&opts, run);
+
+    // Open (or wait for) the file; prime the ring with its recent tail so a
+    // prompt already sitting there is seen, without emitting anything for it.
+    let open_at_end = |w: &mut Watch<'_>| -> Option<(std::fs::File, u64, u64)> {
+        let mut f = std::fs::File::open(path).ok()?;
+        let meta = f.metadata().ok()?;
+        let len = meta.len();
+        let start = len.saturating_sub(ring::DEFAULT_CAPACITY as u64);
+        let mut prime = Vec::new();
+        f.seek(SeekFrom::Start(start)).ok()?;
+        Read::by_ref(&mut f).take(len - start).read_to_end(&mut prime).ok()?;
+        w.ring.push(&prime);
+        Some((f, len, meta.ino()))
+    };
+    let mut file = open_at_end(&mut w);
+    if file.is_none() {
+        log(
+            opts.quiet,
+            &format!("{}: not readable yet; waiting for it", path.display()),
+        );
+    }
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let mut p = libc::pollfd {
+            fd: sig_r.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        unsafe { libc::poll(&mut p, 1, 200) };
+        let mut sb = [0u8; 64];
+        while let Some(n) = read_some(sig_r.as_raw_fd(), &mut sb).filter(|n| *n > 0) {
+            if let Some(&s) = sb[..n].iter().find(|&&s| FORWARDED.contains(&(s as libc::c_int)))
+                && matches!(
+                    s as libc::c_int,
+                    libc::SIGINT | libc::SIGTERM | libc::SIGHUP | libc::SIGQUIT
+                )
+            {
+                return Outcome::Signal(s as libc::c_int);
+            }
+        }
+
+        match &mut file {
+            None => file = open_at_end(&mut w),
+            Some((f, offset, ino)) => {
+                // Rotation (new inode) or truncation: start over at offset 0.
+                if let Ok(meta) = std::fs::metadata(path)
+                    && (meta.ino() != *ino || meta.len() < *offset)
+                    && let Ok(nf) = std::fs::File::open(path)
+                {
+                    *f = nf;
+                    *offset = 0;
+                    *ino = meta.ino();
+                }
+                loop {
+                    match f.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            *offset += n as u64;
+                            w.on_output(&buf[..n]);
+                        }
+                    }
+                }
+            }
+        }
+        w.tick(Instant::now());
+    }
+}
+
 fn final_event(w: &Watch<'_>, outcome: Outcome) -> Event {
     let text = w.ring.text();
     let evidence = ring::tail(&text, w.opts.evidence_bytes).to_string();
     let (mut state, mut severity, reason) = match outcome {
         _ if w.timeout_fired => (State::Failing, Severity::Error, "timeout"),
+        _ if w.cancel_fired => (State::Failing, Severity::Error, "prompt_cancelled"),
         Outcome::Code(0) => (State::Done, Severity::Info, "exit"),
         Outcome::Code(_) => (State::Failing, Severity::Error, "exit"),
         Outcome::Signal(_) => (State::Failing, Severity::Error, "signal"),
