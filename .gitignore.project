@@ -9,6 +9,5 @@
 #   /scratch/
 #   /secrets.local.yaml
 
-/target/
 /result
 /result-*
