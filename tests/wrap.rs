@@ -786,3 +786,39 @@ fn a_grandchild_writing_forever_does_not_keep_us_alive() {
     assert!(st.success());
     assert!(t0.elapsed() < Duration::from_secs(8), "{:?}", t0.elapsed());
 }
+
+#[test]
+fn a_forever_writer_behind_a_slow_reader_is_still_capped() {
+    // A grandchild writes faster than our reader consumes, after the leader
+    // exited: the drain must still end at its cap.
+    use std::io::Read;
+    let e = Env::new();
+    let mut c = e.cmd();
+    c.args([
+        "--no-s1",
+        "-q",
+        "--pipe",
+        "--silence",
+        "0",
+        "--",
+        "sh",
+        "-c",
+        "yes & exit 0",
+    ])
+    .stdout(std::process::Stdio::piped());
+    let t0 = std::time::Instant::now();
+    let mut child = c.spawn().unwrap();
+    let mut out = child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 4096];
+        while matches!(out.read(&mut buf), Ok(n) if n > 0) {
+            std::thread::sleep(Duration::from_millis(40));
+        }
+    });
+    // The final flush waits for the slow reader; a SIGTERM must end it.
+    std::thread::sleep(Duration::from_secs(5));
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let st = child.wait().unwrap();
+    assert!(t0.elapsed() < Duration::from_secs(9), "{:?}", t0.elapsed());
+    assert!(st.success() || st.signal().is_some(), "{st:?}");
+}
