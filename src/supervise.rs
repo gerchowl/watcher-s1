@@ -5,6 +5,7 @@
 use crate::detect;
 use crate::event::{BlockedProc, ENV_PARENT, Event, Exit, ProcInfo, RunInfo, Severity, Sink, State};
 use crate::probe::{Prober, Sample, sample_tree};
+use crate::questions::Surface;
 use crate::ring::{self, Ring};
 use crate::s1::{Client, Verdict};
 use nix::sys::signal::{Signal, kill};
@@ -517,7 +518,7 @@ impl<'a> Watch<'a> {
             let (_, mut ev) = self.pending_stall.take().expect("pending");
             match res {
                 Ok(v) => {
-                    if v.fused >= self.opts.s1.as_ref().map_or(1.0, |c| c.threshold()) {
+                    if v.fused >= self.opts.s1.as_ref().map_or(1.0, |c| c.threshold(Surface::Wrap)) {
                         ev.state = State::Failing;
                         ev.dedup_key = crate::event::dedup_key(&self.run.host, &self.run.cmd, State::Failing);
                     }
@@ -1206,17 +1207,19 @@ fn final_event(w: &Watch<'_>, outcome: Outcome) -> Event {
         Outcome::Code(_) => (State::Failing, Severity::Error, "exit"),
         Outcome::Signal(_) => (State::Failing, Severity::Error, "signal"),
     };
-    // Tier 2 at exit: always for a failure (evidence + confidence), and for
-    // exit 0 only when the tail trips the weak error panel.
+    // Tier 2 at exit, once per run: for a failure it adds evidence and
+    // confidence; for exit 0 it is the only detector of a masked failure.
+    // (A regex pre-filter here caught only 34 % of real failures; see
+    // docs/eval/questions-spike.md.)
     let mut verdict = None;
     let mut reason = reason;
     if let Some(client) = &w.opts.s1
-        && (state != State::Done || detect::looks_failing(&text))
+        && !text.trim().is_empty()
     {
         let tail = ring::tail(&text, client.questions.tail_bytes);
         match client.judge(&w.run.cmd, tail, s1_budget(client)) {
             Ok(v) => {
-                if state == State::Done && v.fused >= client.threshold() {
+                if state == State::Done && v.fused >= client.threshold(Surface::Wrap) {
                     state = State::Failing;
                     severity = Severity::Warn;
                     reason = "masked_failure";

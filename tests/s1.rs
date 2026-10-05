@@ -44,7 +44,7 @@ fn exit_zero_with_failing_tail_is_a_masked_failure() {
     );
     assert_eq!(f["severity"], "warn");
     assert_eq!(f["s1"]["endpoint"], s1.url);
-    assert!((f["s1"]["fused"].as_f64().unwrap() - 0.95).abs() < 1e-9);
+    assert!((f["s1"]["fused"].as_f64().unwrap() - builtin_score(0.95, 0.05)).abs() < 1e-9);
     assert_eq!(f["s1"]["failing"], 0.95);
     assert_eq!(f["s1"]["clean_done"], 0.05);
     assert_eq!(s1.hits(), 1);
@@ -62,7 +62,22 @@ fn one_request_carries_every_question_and_the_measured_state() {
     assert_eq!(bodies.len(), 1);
     let b = &bodies[0];
     let q = b["questions"].as_object().unwrap();
-    assert_eq!(q.keys().collect::<Vec<_>>(), ["failing", "clean_done"]);
+    assert_eq!(
+        q.keys().collect::<Vec<_>>(),
+        [
+            "failing",
+            "clean_done",
+            "red",
+            "any_failure",
+            "exit_status",
+            "tests_failed",
+            "ends_with_error",
+            "succeeded",
+            "error_present",
+            "outcome"
+        ]
+    );
+    assert_eq!(q["outcome"]["type"], "choice");
     assert_eq!(q["failing"]["type"], "noul");
     assert_eq!(
         q["clean_done"]["criteria"]["true"],
@@ -83,17 +98,64 @@ fn one_request_carries_every_question_and_the_measured_state() {
 }
 
 #[test]
-fn clean_exit_zero_makes_no_call() {
+fn every_exit_zero_is_judged_once() {
+    // No regex pre-filter any more (it caught 34 % of real failures): an
+    // exit 0 with an innocent-looking tail is still asked about, once.
     let s1 = FakeS1::start(Reply::Answers {
         failing: 0.9,
         clean_done: 0.1,
     });
     let e = Env::new();
     wrap(&e, &cfg(&e, &[&s1.url], ""), "echo all good; exit 0");
-    assert_eq!(s1.hits(), 0);
+    assert_eq!(s1.hits(), 1);
+    let f = last(&e.events()).clone();
+    assert_eq!(f["reason"], "masked_failure", "System One decides, not a regex");
+}
+
+#[test]
+fn a_clean_verdict_keeps_exit_zero_done() {
+    let s1 = FakeS1::start(Reply::Answers {
+        failing: 0.05,
+        clean_done: 0.95,
+    });
+    let e = Env::new();
+    wrap(&e, &cfg(&e, &[&s1.url], ""), "echo all good; exit 0");
     let f = last(&e.events()).clone();
     assert_eq!(f["state"], "done");
-    assert_eq!(f["s1"], Value::Null);
+    assert!(f["s1"]["fused"].as_f64().unwrap() < 0.5);
+}
+
+#[test]
+fn no_output_means_no_call() {
+    let s1 = FakeS1::start(Reply::Answers {
+        failing: 0.9,
+        clean_done: 0.1,
+    });
+    let e = Env::new();
+    wrap(&e, &cfg(&e, &[&s1.url], ""), "true");
+    assert_eq!(s1.hits(), 0);
+    assert_eq!(last(&e.events())["s1"], Value::Null);
+}
+
+#[test]
+fn wrapper_and_judge_use_their_own_thresholds() {
+    // A score between the two built-in thresholds (wrap 0.5 < s < judge 0.8)
+    // flags in the wrapper but not in the PostToolUse judge.
+    let (f, c) = (0.55, 0.45);
+    let score = builtin_score(f, c);
+    assert!(
+        score > 0.5 && score < 0.8,
+        "pick answers between the thresholds: {score}"
+    );
+    let s1 = FakeS1::start(Reply::Answers {
+        failing: f,
+        clean_done: c,
+    });
+    let e = Env::new();
+    wrap(&e, &cfg(&e, &[&s1.url], ""), "echo 'error: x'; exit 0");
+    assert_eq!(last(&e.events())["reason"], "masked_failure");
+    let r = judge(&e, Some(&s1.url), &bash_input("make 2>&1 | tail", "error: x\n"));
+    assert!(r.stdout.is_empty(), "judge must stay silent below 0.8: {}", r.out());
 }
 
 #[test]
@@ -390,7 +452,7 @@ fn judge_survives_garbage_input() {
 
 /// A one-shot TLS System One on localhost with a fresh self-signed cert.
 /// Returns (url, path of the cert PEM to trust via SSL_CERT_FILE).
-fn tls_fake(e: &Env, reply_body: &'static str, hang: bool) -> (String, std::path::PathBuf) {
+fn tls_fake(e: &Env, reply_body: String, hang: bool) -> (String, std::path::PathBuf) {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use std::io::{Read, Write};
     let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
@@ -448,13 +510,14 @@ fn tls_fake(e: &Env, reply_body: &'static str, hang: bool) -> (String, std::path
     (url, pem)
 }
 
-const FAILING_ANSWERS: &str =
-    r#"{"answers":{"failing":{"type":"noul","noul":0.9},"clean_done":{"type":"noul","noul":0.1}}}"#;
+fn failing_answers() -> String {
+    serde_json::json!({ "answers": answers_json(0.9, 0.1) }).to_string()
+}
 
 #[test]
 fn https_endpoint_with_a_trusted_private_ca() {
     let e = Env::new();
-    let (url, pem) = tls_fake(&e, FAILING_ANSWERS, false);
+    let (url, pem) = tls_fake(&e, failing_answers(), false);
     let r = run({
         let mut c = e.cmd();
         c.env("SSL_CERT_FILE", &pem).args([
@@ -473,13 +536,13 @@ fn https_endpoint_with_a_trusted_private_ca() {
     assert_eq!(r.status.code(), Some(1));
     let f = last(&e.events()).clone();
     assert_eq!(f["s1"]["endpoint"], url, "{f}");
-    assert!((f["s1"]["fused"].as_f64().unwrap() - 0.9).abs() < 1e-9);
+    assert!((f["s1"]["fused"].as_f64().unwrap() - builtin_score(0.9, 0.1)).abs() < 1e-9);
 }
 
 #[test]
 fn https_with_an_untrusted_cert_fails_open() {
     let e = Env::new();
-    let (url, _pem) = tls_fake(&e, FAILING_ANSWERS, false);
+    let (url, _pem) = tls_fake(&e, failing_answers(), false);
     let r = run({
         let mut c = e.cmd();
         c.env_remove("SSL_CERT_FILE").args([
@@ -502,7 +565,7 @@ fn https_with_an_untrusted_cert_fails_open() {
 #[test]
 fn a_hung_tls_handshake_respects_the_deadline() {
     let e = Env::new();
-    let (url, pem) = tls_fake(&e, FAILING_ANSWERS, true);
+    let (url, pem) = tls_fake(&e, failing_answers(), true);
     let r = run({
         let mut c = e.cmd();
         c.env("SSL_CERT_FILE", &pem).args([

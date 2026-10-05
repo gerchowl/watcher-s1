@@ -5,7 +5,7 @@
 use crate::breaker::Breaker;
 use crate::config::S1Config;
 use crate::http;
-use crate::questions::{QuestionSet, build_state, noul};
+use crate::questions::{QuestionSet, Surface, build_state, noul};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::time::{Duration, Instant};
@@ -35,8 +35,8 @@ impl Client {
         }
     }
 
-    pub fn threshold(&self) -> f64 {
-        self.questions.threshold
+    pub fn threshold(&self, surface: Surface) -> f64 {
+        self.questions.threshold(surface)
     }
 
     /// Judge `tail` (already cut to the question set's `tail_bytes`).

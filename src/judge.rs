@@ -162,7 +162,8 @@ pub fn decide(input: &Value, client: Option<&Client>, budget: Duration) -> Optio
     }
     let tail = ring::tail(&out, client.questions.tail_bytes);
     let v = client.judge(cmd, tail, budget).ok()?;
-    if v.fused < client.threshold() {
+    let threshold = client.threshold(crate::questions::Surface::Judge);
+    if v.fused < threshold {
         return None;
     }
     let msg = format!(
@@ -170,7 +171,7 @@ pub fn decide(input: &Value, client: Option<&Client>, budget: Duration) -> Optio
          (System One fused score {:.2} >= {:.2}). Re-run without the filter, or with `set -o pipefail`, before trusting this result.",
         evidence_line(tail),
         v.fused,
-        client.threshold()
+        threshold
     );
     Some(json!({
         "hookSpecificOutput": {

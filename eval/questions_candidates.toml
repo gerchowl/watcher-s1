@@ -1,43 +1,7 @@
-# watcher-s1 built-in System One question set.
-#
-# This file is DATA, not code: the binary embeds it as the `builtin` set, and a
-# config can point `[systemone] questions = "/path/to/file.toml"` at a copy
-# with the same shape. goal-s1 and other clients can read the same file.
-#
-# Measured in docs/eval/questions-spike.md: 1,474 real labelled Bash calls
-# (574 failures by exit code, 900 successes), exit status hidden. The
-# logistic score below was fitted on a session-grouped dev split and measured
-# once on the held-out split: AUC 0.95 (the previous fused default: 0.88).
-#   wrap  @0.5 (4 KB tail):  precision 0.93, recall 0.81, FPR 4.0 %
-#   judge @0.8 (20-line tail): precision 0.95, recall 0.71, FPR 2.2 %
-# Changing a question's wording changes its answers: re-run eval/ before
-# editing, and refit the weights.
-
-# A score at or above the threshold flags the output as an unrecovered
-# failure. Per surface: the wrapper judges rare events (exit, silence), the
-# PostToolUse judge every piped exit-0 call, so it is stricter.
-threshold = { wrap = 0.5, judge = 0.8 }
-
-# How much of the output tail goes into the state, in bytes.
-tail_bytes = 4096
-
-# score = sigmoid(bias + sum(weight * feature)); a feature is a noul
-# question, or "<choice question>:<label>+<label>" (summed probability).
-[score]
-kind = "logistic"
-bias = -2.1237
-
-[score.weights]
-failing = 0.0140
-clean_done = -0.4870
-red = 0.9736
-any_failure = 0.7419
-exit_status = 1.0093
-tests_failed = 0.1530
-ends_with_error = 1.0240
-succeeded = -0.6551
-error_present = 0.9072
-"outcome:failure+partial" = 1.1975
+# Candidate System One questions for the g-fleet#244 follow-up spike.
+# All are sent in ONE request per state; eval/score.py fits and compares
+# single questions and fusions. The winners are copied to
+# questions/builtin.toml.
 
 [questions.failing]
 type = "noul"

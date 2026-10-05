@@ -22,7 +22,7 @@ Design and measurements: [g-fleet#244](https://github.com/gerchowl/g-fleet/issue
 |---|---|---|
 | 0 | output-silence timer, hard `--timeout` (TERM then KILL the whole process group), process-state sampler (Linux `D` state + `wchan`, darwin `U` state) | continuously, cheap |
 | 1 | regex on the unterminated last line for prompts (`password:`, `[y/N]`, `(yes/no)`, host-key questions, "Press … key", …); a weak error-line panel | when the output goes quiet |
-| 2 | a [System One](#system-one) judgement of the last 4 KB (`failing` + `clean_done`, fused) | **only at event time**: on exit, at the silence threshold, and on an exit 0 whose tail looks failing. Never on a poll. |
+| 2 | a [System One](#system-one) judgement of the last 4 KB (ten questions, one logistic score) | **only at event time**: once at exit (any exit that produced output), and at the silence threshold. Never on a poll. |
 
 **It is not** an alerting system. It owns no policy: no Telegram, no quiet
 hours, no dedupe windows. It emits events with a `severity` and a stable
@@ -56,7 +56,9 @@ only wraps (`watcher-s1 -- cmd`) or passively follows a log file
 - **Your stdout never stalls the watch.** Output goes to stdout through a
   writer thread and a bounded queue. If whoever reads it stops, the child is
   back-pressured but the timers (`--silence`, `--timeout`, prompt cancel) keep
-  running.
+  running. Like any process, watcher-s1 still finishes its last write before
+  it exits, so it waits for a reader that comes back. At exit it drains what
+  the child left in the pipes (at most 3 s if a grandchild keeps writing).
 - **Fail open.** If System One is not configured, down or slow, the event
   carries `"s1": null` and everything else works.
 
@@ -144,7 +146,7 @@ must ignore unknown fields).
 | `failing` | `silence` | warn | silence, and System One reads the tail as an unrecovered failure |
 | `progressing` | `resumed` | info | output resumed after a warn event |
 | `done` | `exit` | info | exit 0 and nothing flags it (final event) |
-| `failing` | `masked_failure` | warn | exit 0, but System One's fused score ≥ threshold (final event) |
+| `failing` | `masked_failure` | warn | exit 0, but System One's score ≥ the wrapper threshold (final event) |
 | `failing` | `exit` / `signal` / `timeout` | error | non-zero exit, death by signal, or killed by `--timeout` (final event) |
 | `failing` | `prompt_cancelled` | error | `--on-prompt cancel` cancelled an unanswered prompt (final event) |
 
@@ -196,23 +198,32 @@ questions = "builtin"                           # or a path to a question file
 ### Questions
 
 The built-in set is data: [`questions/builtin.toml`](questions/builtin.toml),
-embedded in the binary. These are the measured winners from g-fleet#244: `failing`
-("Does the output show an error that the process did not recover from?") and
-`clean_done` ("Did the process reach a clean, successful end?"), fused as
-`(failing + (1 - clean_done)) / 2` and flagged at ≥ 0.8. Point
-`questions = "/path/q.toml"` (or `.json`) at a file of the same shape to change
-the questions, the fusion (`[score] positive / negative`) or the threshold
-without rebuilding.
+embedded in the binary. It holds ten typed questions about the output:
+- `noul` phrasings of "did it fail?", for example "Would this command most
+  likely exit with a non-zero status?" and "Does the output end with an error
+  message?";
+- an `outcome` choice (success / failure / partial / info).
 
-**Measured behaviour worth knowing** (Kev, 2026-10-05): tails that *end in an
-error* fuse high (compile error 0.89, nix builder failure 0.96, Python
-traceback 0.94), but a *test-runner summary* ("1 failed, 6 passed",
-`test result: FAILED`) fuses around 0.45–0.5, because `clean_done` reads "the
-run reached its summary" as a clean end. Such runs are ranked above clean
-ones but not flagged at 0.8. A non-zero exit is always `failing` anyway; the
-gap only matters for masked exit-0 runs. If that matters for you, use a
-question file with `positive = ["failing"]` and no `negative`: g-fleet#244's
-masked-pipe audit (5/5 precise) used `failing ≥ 0.8` alone.
+They combine into one logistic score (`s1.fused` in events). Its weights were
+fitted and measured on 1,474 real labelled commands: AUC 0.95, against 0.88
+for the previous two-question default, which flagged only 18 % of real
+failures. Method and tables: [`docs/eval/questions-spike.md`](docs/eval/questions-spike.md).
+
+**Thresholds per surface:**
+- **The wrapper flags at ≥ 0.5:** recall 0.81, false-positive rate 4 %. It
+  judges rare events.
+- **The PostToolUse judge flags at ≥ 0.8:** recall 0.71, false-positive rate
+  2.2 %. It fires on every piped call, so it is stricter.
+
+To change the questions, the score or the thresholds without rebuilding,
+point `questions = "/path/q.toml"` (or `.json`) at a file of the same shape:
+- `[score] kind = "logistic"` takes a `bias` plus `weights`, keyed by a
+  `noul` name or `"<choice>:<label>+<label>"`;
+- `kind = "mean"` takes `positive` / `negative`;
+- `threshold` is a number, or `{ wrap, judge }`.
+
+Re-run [`eval/`](eval) before changing any wording: a reworded question
+answers differently.
 
 ## Claude Code
 
@@ -259,7 +270,7 @@ hook acts only when all of these hold: the command pipes into a filter
 (`tail`, `head`, `grep`, `rg`, `sed`, `awk`, `sort`, `tee`, `jq`, …; a
 `pipefail` command is skipped), the call was neither backgrounded nor
 interrupted, and a System One endpoint is configured (same precedence as
-above). It judges the last 4 KB of stdout and stderr. At fused ≥ threshold it
+above). It judges the last 4 KB of stdout and stderr. At a score ≥ the judge threshold (0.8) it
 prints:
 
 ```json

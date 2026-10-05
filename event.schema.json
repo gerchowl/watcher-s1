@@ -67,7 +67,7 @@
           "additionalProperties": false
         }
       ],
-      "description": "System One verdict, or null when the tier is off, was not consulted, or failed open."
+      "description": "System One verdict, or null when the tier is off, was not consulted, or failed open. `fused` is the question set's score (since the logistic set: sigmoid of the weighted answers); `failing`/`clean_done` are those two questions' raw answers."
     },
     "proc": {
       "type": "object",

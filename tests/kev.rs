@@ -23,8 +23,8 @@ fn real_system_one_sequential() {
     // A tail that ENDS in an error: the measured fused score clears 0.8.
     let failing = "   Compiling foo v0.1.0 (/x)\nerror[E0425]: cannot find value `cfg` in this scope\n  --> src/main.rs:12:5\n   |\n12 |     cfg.run();\n   |     ^^^ not found in this scope\n\nerror: could not compile `foo` (bin \"foo\") due to 1 previous error\n";
     let clean = "running 3 tests\ntest parse ... ok\ntest roundtrip ... ok\ntest edge ... ok\n\ntest result: ok. 3 passed; 0 failed; 0 ignored\n";
-    // A test summary reads as "reached its end" to `clean_done`, so its fused
-    // score sits near 0.5 (measured 2026-10-05): ranked, but not flagged.
+    // A failing test-runner summary: the old fused default scored it ~0.45
+    // (missed); the logistic set scores it ~0.89 (measured 2026-10-05).
     let summary = "running 3 tests\ntest parse ... ok\ntest roundtrip ... FAILED\ntest edge ... ok\n\nfailures:\n    roundtrip\n\ntest result: FAILED. 2 passed; 1 failed; 0 ignored\n\nerror: test failed, to rerun pass `--lib`\n";
 
     // 1. Wrapper, exit 0 with a failing tail (the masked-failure path).
@@ -60,7 +60,8 @@ fn real_system_one_sequential() {
     };
     let (f_summary, f_clean) = (fused_of(summary), fused_of(clean));
     eprintln!("fused: failing summary {f_summary:.3}, clean summary {f_clean:.3}");
-    assert!(f_summary > f_clean + 0.2);
+    assert!(f_summary >= 0.8, "failing test summary must flag: {f_summary}");
+    assert!(f_clean < 0.5, "clean summary must not flag: {f_clean}");
 
     // 2. Judge hook on a piped command whose output is clean: no output.
     let judge = |cmd: &str, out: &str| {
@@ -88,6 +89,7 @@ fn real_system_one_sequential() {
     let quiet = judge("cargo test 2>&1 | tail -20", clean);
     let summary_out = judge("cargo test 2>&1 | tail -20", summary);
     eprintln!("judge on a failing test summary: {summary_out:?}");
+    assert!(summary_out.contains("exit 0 came from the pipe"));
     eprintln!("judge on clean output: {quiet:?}");
     assert!(quiet.is_empty());
 
