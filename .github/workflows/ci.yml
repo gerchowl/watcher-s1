@@ -1,0 +1,745 @@
+# Managed by vigOS devkit — regenerated on upgrade; local edits are lost.
+# Customize in justfile.project. Bugs / missing tools: https://github.com/vig-os/devkit/issues
+
+# CI Workflow (mode-aware)
+#
+# One workflow for every DEVKIT_MODE. Toolchain provisioning is split from image
+# selection per https://github.com/vig-os/devkit/blob/main/docs/rfcs/ADR-conditional-container-toolchain.md (Option A,
+# #991): a leading `resolve-toolchain` job reads `.vig-os` and outputs the
+# delivery `mode` and container `image` — the devcontainer image for the
+# container-ish modes, an EXPLICIT EMPTY STRING for direnv/bare (which makes the
+# downstream job run directly on the host runner). Every job then declares
+# `container: image: ${{ needs.resolve-toolchain.outputs.image }}` — inert on the
+# host when the image is empty (proven by the #992 spike) — and calls the shared
+# `setup-devkit-toolchain` composite as its first step to provision the toolchain
+# for its mode (in-image env for container, the Nix flake dev-shell for direnv,
+# a uv host install for bare). After that preamble, plain
+# `just sync|precommit|test` runs identically in every mode.
+#
+# This collapses the former per-mode ci.yml overlays (container / direnv / bare)
+# into a single managed file (#991).
+#
+# Runner selection (#1173): `resolve-toolchain` also emits `runner-json`, a JSON
+# array of runner labels from the optional `.vig-os` key `DEVKIT_CI_RUNNER`
+# (comma-separated; absent => the hosted default). The toolchain jobs (lint,
+# test, commit-checks) and the summary gate declare
+# `runs-on: ${{ fromJSON(needs.resolve-toolchain.outputs.runner-json) }}`, so a
+# self-hosted consumer routes them onto its own runners without hand-editing this
+# managed file. `resolve-toolchain` itself cannot consume `runner-json` (it
+# produces the output — chicken-and-egg); its runner comes from the optional
+# repo/org variable `DEVKIT_CI_RESOLVE_RUNNER` instead, since `vars` resolves
+# before any runner exists (#1796). `dependency-review` stays hosted
+# (public-repo-only, toolchain-free, and reads GitHub's dependency-graph API).
+#
+# Dev-shell gcroot (#1601): those same three lanes pass the resolved
+# `dev-profile-path` (from the optional `.vig-os` key DEVKIT_DEV_PROFILE_PATH)
+# into the toolchain action. An EPHEMERAL self-hosted runner wipes RUNNER_TEMP —
+# and with it the dev-shell's gcroot — between jobs while its /nix/store
+# persists, so the closure every run needs is left collectable by the host's
+# nix.gc. Absent => the RUNNER_TEMP default, unchanged for hosted consumers.
+#
+# Jobs:
+#   1. resolve-toolchain — Resolve delivery mode + image from .vig-os
+#   2. lint              — Pre-commit hooks
+#   3. test              — Run tests
+#   4. commit-checks     — Commit message + PR title validation (PRs only)
+#   5. scaffold-drift    — Managed-file drift gate (PRs only; DEVKIT_DRIFT_CHECK)
+#   6. dependency-review — Vulnerable-dependency gate (public-repo PRs only)
+#   7. summary           — Aggregate results for branch protection
+#
+# Triggers:
+#   - Pull requests to any base branch (stacked PRs verified)
+#   - Manual workflow_dispatch
+#
+
+name: CI
+
+on:  # yamllint disable-line rule:truthy
+  pull_request:
+    # Any base, so a PR stacked on a topic branch is verified too; the
+    # concurrency group cancels superseded runs (#1759).
+    branches:
+      - '**'
+  workflow_dispatch:
+    inputs:
+      test-suite:
+        description: 'Test suite to run'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - lint
+          - test
+      image-tag:
+        description: 'Container image tag to use'
+        required: false
+        type: string
+
+# Cancel a superseded run instead of letting it burn runner slots (#1602): a
+# force-push or rapid follow-up leaves the previous run's every lane finishing
+# for a commit that no longer matters — wasted minutes on a hosted runner, and
+# on a self-hosted consumer with a small fixed slot pool the replacement run
+# queues behind its own predecessor. Grouping per workflow AND per ref keeps
+# distinct refs (other PRs, dispatches on other branches) independent.
+# `!= 'push'` rather than a bare `true`: neither trigger is `push` today, so the
+# guard is inert, but a deploy gating on the exact-commit CI run must stay
+# satisfiable if one is ever added. Not `== 'pull_request'` either — a
+# dispatched re-test superseding the previous one is wanted. A cancelled run
+# cannot green the required check: the summary job trips on `cancelled` (#1371).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  resolve-toolchain:
+    name: Resolve toolchain
+    runs-on: ${{ vars.DEVKIT_CI_RESOLVE_RUNNER || 'ubuntu-26.04' }}
+    timeout-minutes: 2
+    outputs:
+      mode: ${{ steps.resolve.outputs.mode }}
+      image: ${{ steps.resolve.outputs.image }}
+      image-tag: ${{ steps.resolve.outputs.image-tag }}
+      runner-json: ${{ steps.resolve.outputs.runner-json }}
+      # Dev-shell gcroot (#1601): re-export the vetted DEVKIT_DEV_PROFILE_PATH
+      # so the toolchain lanes — the ones runner-json can move onto a
+      # self-hosted host — root the dev-shell where an ephemeral job cannot
+      # wipe it.
+      dev-profile-path: ${{ steps.resolve.outputs.dev-profile-path }}
+      # Refs policy (#1282): re-export the composite action's mapped
+      # --refs-optional-types list so commit-checks can consume it via needs.
+      refs-optional-types: ${{ steps.resolve.outputs.refs-optional-types }}
+      # Commit types (#1431): re-export the resolved approved-types list so
+      # commit-checks can consume it via needs.
+      commit-types: ${{ steps.resolve.outputs.commit-types }}
+      # Branch types (#1432): re-export the resolved branch-type set so the
+      # commit-checks branch-name gate can consume it via needs.
+      branch-types: ${{ steps.resolve.outputs.branch-types }}
+      issueless-branch-types: ${{ steps.resolve.outputs.issueless-branch-types }}
+      # Scaffold-drift gate (#1295): re-export the DEVKIT_DRIFT_CHECK toggle so
+      # the scaffold-drift job's `if:` can self-skip when a consumer opts out,
+      # plus the all-modes image ref it `docker run`s (keeps the ghcr literal in
+      # resolve-toolchain, the #991 SSoT, out of this file).
+      drift-check: ${{ steps.resolve.outputs.drift-check }}
+      drift-image: ${{ steps.resolve.outputs.drift-image }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          # flake.nix is parsed by the flake-pin lockstep gate below (#1752).
+          sparse-checkout: |
+            .vig-os
+            .github/actions/resolve-toolchain
+            pyproject.toml
+            package.json
+            Cargo.toml
+            flake.nix
+          sparse-checkout-cone-mode: false
+
+      - name: Resolve toolchain
+        id: resolve
+        uses: ./.github/actions/resolve-toolchain
+        with:
+          registry-token: ${{ secrets.GHCR_PULL_TOKEN || github.token }}
+          registry-username: ${{ github.actor }}
+          image-tag: ${{ inputs.image-tag }}
+
+      # Declared-language gate (#1478). `just test` / `just lint` are guarded on
+      # `[ -f pyproject.toml ]` and exit 0 when it is absent, so a repo whose
+      # entire Python project was deleted still reported a green `Tests` check
+      # (#1466) — CI could not tell "no suite by design" from "the suite
+      # vanished". The `.vig-os` declaration is the missing evidence; this step
+      # asserts it.
+      #
+      # ONE gate for the whole workflow, run as a step of resolve-toolchain
+      # rather than as its own job: every toolchain job already `needs:` this
+      # one, so a failure here stops lint/test/commit-checks before they start
+      # (which covers the identical lint/format blind spot at the same time), it
+      # reuses the checkout this job already performs, and it costs no extra
+      # runner, container pull or `needs:` edge in the summary gate. The marker
+      # files are added to the sparse checkout above for exactly this step.
+      #
+      # A language-neutral repo declares nothing and stays green. `nix` is
+      # declared but never gated: it has no single marker file (flake.nix ships
+      # with every direnv scaffold), so its absence is not decidable from a path.
+      # The declared list reaches the shell via env, never inline `${{ }}` (the
+      # zizmor template-injection gate / #1279 env-routing pattern).
+      - name: Check declared languages
+        env:
+          LANGUAGES: ${{ steps.resolve.outputs.languages }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$LANGUAGES" ]]; then
+            echo "No languages declared in .vig-os (DEVKIT_LANGUAGES) — nothing to check."
+            exit 0
+          fi
+
+          MISSING=()
+          IFS=',' read -ra declared <<< "$LANGUAGES"
+          for lang in "${declared[@]}"; do
+            case "$lang" in
+              python) marker="pyproject.toml" ;;
+              node) marker="package.json" ;;
+              rust) marker="Cargo.toml" ;;
+              nix)
+                echo "Declared language 'nix': no single marker file — not gated."
+                continue
+                ;;
+              *)
+                echo "::warning::Unknown language '$lang' in DEVKIT_LANGUAGES — not gated. Expected a subset of: python, node, rust, nix."
+                continue
+                ;;
+            esac
+            if [[ -f "$marker" ]]; then
+              echo "Declared language '$lang': $marker present."
+            else
+              echo "::error::Declared language '$lang' but $marker is missing from the repository root."
+              MISSING+=("$lang ($marker)")
+            fi
+          done
+
+          if [[ ${#MISSING[@]} -gt 0 ]]; then
+            echo "::error::.vig-os declares language(s) whose project file is gone: ${MISSING[*]}. The lint/test recipes skip a language whose marker file is absent, so nothing else in this workflow would notice. Restore the missing file(s), or — if the language was dropped deliberately — remove it from DEVKIT_LANGUAGES in .vig-os."
+            exit 1
+          fi
+
+      # Flake-pin lockstep gate (#1752, #1756). A direnv/both consumer that PINS
+      # its devkit flake input builds its dev shell (hooks, vig-utils) from that
+      # pin, while .vig-os DEVKIT_VERSION drives the scaffold — an adoption that
+      # moved only DEVKIT_VERSION wired hooks the old toolchain could not spawn.
+      # Same placement rationale as the languages gate above: a failure here
+      # skips every toolchain job and the summary reports it. Floating inputs,
+      # non-release pins, bare and devcontainer modes are never gated; the
+      # scaffold-drift opt-out does not apply. The regex is byte-identical to
+      # init-workspace.sh's lagging-pin WARNING regex (keep them in sync;
+      # install.sh's flake-bump detector is a different, broader one).
+      # A dispatch that reroutes the image makes image-tag diverge from .vig-os;
+      # PR runs never set it.
+      - name: Check flake pin lockstep
+        if: ${{ !inputs.image-tag }}
+        env:
+          MODE: ${{ steps.resolve.outputs.mode }}
+          DEVKIT_VERSION: ${{ steps.resolve.outputs.image-tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$MODE" != "direnv" && "$MODE" != "both" ]] || [[ ! -f flake.nix ]]; then
+            exit 0
+          fi
+          pinned_line="$(grep -E '^[[:space:]]*(inputs\.)?[A-Za-z0-9_-]+\.url[[:space:]]*=[[:space:]]*"github:vig-os/devkit[/?][^"]+"' \
+            flake.nix | head -n1 || true)"
+          if [[ -z "$pinned_line" ]]; then
+            exit 0
+          fi
+          pinned_input="$(sed -E 's/^[[:space:]]*(inputs\.)?([A-Za-z0-9_-]+)\.url.*/\2/' <<<"$pinned_line")"
+          pinned_ref="$(sed -E 's|.*"github:vig-os/devkit[/?](ref=)?([^"]+)".*|\2|' <<<"$pinned_line")"
+          release_re='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+          if [[ -z "$DEVKIT_VERSION" ]]; then
+            echo "::warning::.vig-os DEVKIT_VERSION is empty — cannot check the pinned devkit input '$pinned_input' ($pinned_ref)."
+            exit 0
+          fi
+          if ! [[ "$pinned_ref" =~ $release_re ]]; then
+            echo "::warning::flake.nix pins the devkit input '$pinned_input' to '$pinned_ref', not a release version — not checked against DEVKIT_VERSION $DEVKIT_VERSION."
+            exit 0
+          fi
+          if [[ "$pinned_ref" != "$DEVKIT_VERSION" ]]; then
+            echo "::error::flake.nix pins the devkit input '$pinned_input' to $pinned_ref but .vig-os DEVKIT_VERSION is $DEVKIT_VERSION — the scaffold and its toolchain must move together. In one commit: bump the pin, run 'nix flake update $pinned_input', and set DEVKIT_FLAKE_PIN_ADVANCE=true in .vig-os so upgrades do this for you."
+            exit 1
+          fi
+          echo "flake.nix pins the devkit input '$pinned_input' to $pinned_ref, matching DEVKIT_VERSION."
+
+  lint:
+    name: Lint & Format
+    needs: [resolve-toolchain]
+    runs-on: ${{ fromJSON(needs.resolve-toolchain.outputs.runner-json) }}
+    # Empty image (direnv/bare) => runs on the host; non-empty => in-container.
+    # The credentials block is inert on the host (proven by the #992 spike).
+    container:
+      image: ${{ needs.resolve-toolchain.outputs.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GHCR_PULL_TOKEN || github.token }}
+    timeout-minutes: 15
+    if: |
+      github.event_name != 'workflow_dispatch' ||
+      inputs.test-suite == 'all' ||
+      inputs.test-suite == 'lint'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Mode-aware preamble: exports the in-image env + prek skew guard in
+      # container mode, provisions the Nix dev-shell (direnv) or the uv host
+      # toolchain (bare) otherwise. After this, `just` works in every mode.
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: ${{ needs.resolve-toolchain.outputs.mode }}
+          devkit-version: ${{ needs.resolve-toolchain.outputs.image-tag }}
+          cachix-cache: ${{ vars.CACHIX_CACHE }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          dev-profile-path: ${{ needs.resolve-toolchain.outputs.dev-profile-path }}
+
+      - name: Sync project dependencies
+        run: just sync
+
+      - name: Run pre-commit hooks
+        run: just precommit
+
+  test:
+    name: Tests
+    needs: [resolve-toolchain]
+    runs-on: ${{ fromJSON(needs.resolve-toolchain.outputs.runner-json) }}
+    container:
+      image: ${{ needs.resolve-toolchain.outputs.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GHCR_PULL_TOKEN || github.token }}
+    timeout-minutes: 20
+    if: |
+      github.event_name != 'workflow_dispatch' ||
+      inputs.test-suite == 'all' ||
+      inputs.test-suite == 'test'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: ${{ needs.resolve-toolchain.outputs.mode }}
+          devkit-version: ${{ needs.resolve-toolchain.outputs.image-tag }}
+          cachix-cache: ${{ vars.CACHIX_CACHE }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          dev-profile-path: ${{ needs.resolve-toolchain.outputs.dev-profile-path }}
+
+      - name: Sync project dependencies
+        run: just sync
+
+      - name: Run tests
+        run: just test
+
+  # Commit-message validation. `validate-commit-msg` is a commit-msg stage
+  # hook, so `just precommit` (prek run --all-files) never runs it — the only
+  # other enforcement path is the local .githooks shim, which is silently inert
+  # whenever core.hooksPath is unset or stale. This lane re-checks the standard
+  # against the commits the PR actually proposes to write into history.
+  commit-checks:
+    name: Commit Messages
+    needs: [resolve-toolchain]
+    runs-on: ${{ fromJSON(needs.resolve-toolchain.outputs.runner-json) }}
+    container:
+      image: ${{ needs.resolve-toolchain.outputs.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GHCR_PULL_TOKEN || github.token }}
+    timeout-minutes: 15
+    # pull_request only: there is no base ref to diff against on dispatch.
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The default depth-1 clone has neither the base branch nor the PR's
+          # own commits, and validate-commit-range walks base..head.
+          fetch-depth: 0
+
+      - name: Set up devkit toolchain
+        uses: ./.github/actions/setup-devkit-toolchain
+        with:
+          mode: ${{ needs.resolve-toolchain.outputs.mode }}
+          devkit-version: ${{ needs.resolve-toolchain.outputs.image-tag }}
+          cachix-cache: ${{ vars.CACHIX_CACHE }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          dev-profile-path: ${{ needs.resolve-toolchain.outputs.dev-profile-path }}
+
+      # Branch-name gate (#1432 / #1430): validate the PR head ref with
+      # vig-utils' validate-branch-name — the SAME implementation the local
+      # validate-branch-name hook runs (#1760), so the accepted shapes (main,
+      # dev, <issueless-type>/<slug>, <type>/<issue>-<slug>, worktree/<n>,
+      # renovate/*, release/X.Y.Z) cannot drift between the two. The local
+      # hook depends on local git config a fresh clone does not have
+      # (core.hooksPath), so this is the enforcement point that survives an
+      # un-initialised clone; automation branches never run local hooks but
+      # do open PRs. No --workflow: a deliberate PR from `dev` stays possible
+      # in either model. The head ref is attacker-controlled text, so it
+      # reaches the check via env, never inline ${{ }} (the zizmor
+      # template-injection gate / #1279 env-routing pattern); the type sets
+      # are mapped once from DEVKIT_BRANCH_TYPES and the Refs-optional set by
+      # resolve-toolchain.
+      - name: Validate branch name
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          BRANCH_TYPES: ${{ needs.resolve-toolchain.outputs.branch-types }}
+          ISSUELESS_BRANCH_TYPES: ${{ needs.resolve-toolchain.outputs.issueless-branch-types }}
+        run: |
+          set -euo pipefail
+          # The validator's last stderr line is its verdict; surface it as the
+          # step's annotation.
+          if ! err="$(uv run validate-branch-name \
+              --branch="${HEAD_REF}" \
+              --types="${BRANCH_TYPES}" \
+              --issueless-types="${ISSUELESS_BRANCH_TYPES}" 2>&1 >/dev/null)"; then
+            printf '%s\n' "${err}" >&2
+            echo "::error::${err##*$'\n'}"
+            exit 1
+          fi
+          echo "Branch name OK: ${HEAD_REF}"
+
+      # The PR title is attacker-controlled text, so it reaches the validator as
+      # an environment variable — never interpolated into the shell command.
+      # The range starts at the merge-base with the *current* base branch, not
+      # at pull_request.base.sha: if the branch merged the base back in,
+      # base.sha would drag already-landed commits into the range and fail the
+      # PR for history it did not author.
+      - name: Validate commit messages and PR title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Refs policy (#1282) + commit types (#1431): the resolved lists reach
+          # the validator via env, never inline ${{ }} in the run block (the
+          # zizmor template-injection gate / #1279 env-routing pattern). Each is
+          # mapped once from its .vig-os key by resolve-toolchain.
+          REFS_OPTIONAL_TYPES: ${{ needs.resolve-toolchain.outputs.refs-optional-types }}
+          COMMIT_TYPES: ${{ needs.resolve-toolchain.outputs.commit-types }}
+        run: |
+          set -euo pipefail
+          BASE_SHA="$(git merge-base "origin/${BASE_REF}" "${HEAD_SHA}")"
+          echo "Validating ${BASE_SHA}..${HEAD_SHA} (base: ${BASE_REF})"
+          # A release PR (release/* -> main) spans pre-migration history that
+          # predates the commit gate. Those commits were gated (or
+          # grandfathered) on their way into the trunk branch, so exclude
+          # anything already reachable from origin/main — a no-op on a main PR
+          # (its base IS main) that only tightens the release-PR range (#1149).
+          EXCLUDE=()
+          TRUNK="main"
+          if [ "${BASE_REF}" != "${TRUNK}" ] && \
+             git fetch --no-tags --quiet origin "${TRUNK}" 2>/dev/null; then
+            EXCLUDE+=(--exclude-reachable "origin/${TRUNK}")
+          fi
+          uv run validate-commit-range \
+            --base "${BASE_SHA}" \
+            --head "${HEAD_SHA}" \
+            --title "${PR_TITLE}" \
+            --types "${COMMIT_TYPES}" \
+            --refs-optional-types "${REFS_OPTIONAL_TYPES}" \
+            --blocked-patterns .github/agent-blocklist.toml \
+            ${EXCLUDE[@]+"${EXCLUDE[@]}"}
+
+      # The PR title and body are attacker-controlled text visible in the UI and
+      # notifications even though the body never enters git history, so they reach
+      # the guard as environment variables — never interpolated into the shell
+      # command. validate-commit-range already covers the title; this adds the
+      # body as cheap defense-in-depth against the agent blocklist.
+      - name: Check PR title and body for agent fingerprints
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: uv run check-pr-agent-fingerprints
+
+  # Scaffold-drift gate (#1295): re-run the pinned devkit version's scaffold over
+  # the checkout and fail if any managed file diverges — DEVKIT_VERSION bumped
+  # without re-scaffolding, or a managed file hand-edited. A pin-only bump PR
+  # otherwise merges green: nothing else re-runs the scaffold or diffs against it.
+  #
+  # Mechanism: re-scaffold + `git diff`, NOT `install.sh --preview`. The preview
+  # report classifies OVERWRITTEN by path existence, not content, so it fires for
+  # every managed file that exists and cannot distinguish drift from an
+  # up-to-date file. Re-running init-workspace.sh --force rewrites the managed
+  # files to exactly what the pin produces while preserving *.project files and
+  # persisted .vig-os values by construction; `git diff` (which honors .gitignore,
+  # so *.local files are exempt too) then surfaces any real divergence.
+  #
+  # This runs the in-image scaffold via `docker run` on the host runner rather
+  # than a job-level `container:`, because a direnv/bare consumer resolves an
+  # EMPTY image (its jobs run on the host) yet the scaffold assets live only
+  # inside the devcontainer image. Passing VIG_OS_VERSION=<current pin> keeps the
+  # .vig-os DEVKIT_VERSION line stable (the image's baked full version would
+  # otherwise rewrite a floating pin and read as spurious drift).
+  #
+  # Cost control: PRs only (the ~1.5 GiB image pull). A single workflow cannot
+  # apply a per-job `paths` filter, so the job rides the same pull_request-only
+  # gate as commit-checks/dependency-review; the DEVKIT_DRIFT_CHECK knob
+  # self-skips it at runtime (no re-scaffold needed to flip).
+  scaffold-drift:
+    name: Scaffold Drift
+    needs: [resolve-toolchain]
+    runs-on: ${{ fromJSON(needs.resolve-toolchain.outputs.runner-json) }}
+    timeout-minutes: 15
+    if: >-
+      github.event_name == 'pull_request' &&
+      needs.resolve-toolchain.outputs.drift-check != 'false'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # All ${{ }} values reach the shell via env (never inline in run:), per the
+      # zizmor template-injection gate. The inner `docker run` script is a
+      # single-quoted literal — it reads only the -e env it is handed.
+      - name: Check for scaffold drift
+        env:
+          IMAGE: ${{ needs.resolve-toolchain.outputs.drift-image }}
+          IMAGE_TAG: ${{ needs.resolve-toolchain.outputs.image-tag }}
+          REGISTRY_TOKEN: ${{ secrets.GHCR_PULL_TOKEN || github.token }}
+          REGISTRY_USERNAME: ${{ github.actor }}
+          CONSUMER_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$IMAGE" ]]; then
+            echo "::error::Could not resolve DEVKIT_VERSION from .vig-os — cannot run the scaffold-drift check."
+            exit 1
+          fi
+
+          echo "Authenticating to ghcr.io as '${REGISTRY_USERNAME}'"
+          echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$REGISTRY_USERNAME" --password-stdin
+          echo "Pulling $IMAGE"
+          docker pull --quiet "$IMAGE"
+
+          # Re-scaffold in place inside the pinned image, then diff. The scaffold
+          # writes root-owned files into the mounted checkout, so run git in the
+          # same container (as root) with the mount marked a safe directory.
+          docker run --rm \
+            -e VIG_OS_VERSION="$IMAGE_TAG" \
+            -e GITHUB_REPOSITORY="$CONSUMER_REPOSITORY" \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            "$IMAGE" \
+            bash -c '
+              set -euo pipefail
+              git config --global --add safe.directory /workspace
+              /root/assets/init-workspace.sh --force --no-prompts
+              cd /workspace
+              git add -A
+              if git diff --cached --quiet; then
+                echo "No scaffold drift detected — managed files match devkit ${VIG_OS_VERSION}."
+                exit 0
+              fi
+              echo "::error::Scaffold drift detected: the working tree diverges from what devkit ${VIG_OS_VERSION} would scaffold. Re-run the devkit upgrade (install.sh --force) and commit the result, or set DEVKIT_DRIFT_CHECK=false in .vig-os to opt out."
+              git --no-pager diff --cached
+              exit 1
+            '
+
+  # Warn-only staleness report (#1497): scaffold-drift resolves its comparison
+  # image from the consumer's own DEVKIT_VERSION pin, so "behind the latest
+  # devkit release" is invisible to it by construction — a consumer sat two
+  # minor versions behind with a green drift check. This job answers that
+  # question with a cheap API query and NEVER fails the build: the report is a
+  # ::warning annotation plus a step-summary block, not a gate. Deliberately
+  # not gated on DEVKIT_DRIFT_CHECK (no docker, no image pull — disabling the
+  # expensive drift gate must not silence the cheap staleness report) and
+  # deliberately absent from the summary gate's needs (warn-only must never
+  # block a merge).
+  devkit-staleness:
+    name: Devkit staleness
+    needs: [resolve-toolchain]
+    runs-on: ${{ fromJSON(needs.resolve-toolchain.outputs.runner-json) }}
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+
+    steps:
+      - name: Compare DEVKIT_VERSION against the latest devkit release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PIN: ${{ needs.resolve-toolchain.outputs.image-tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PIN" ]; then
+            echo "No DEVKIT_VERSION pin resolved; nothing to compare."
+            exit 0
+          fi
+          # Stable releases only: drafts and prereleases never count as "the
+          # release you are behind". Every failure path (offline runner, API
+          # error, missing gh on a self-hosted runner) degrades to a skip.
+          RELEASES="$(gh api repos/vig-os/devkit/releases --paginate \
+            --jq '.[] | select((.draft or .prerelease) | not) | .tag_name' 2>/dev/null || true)"
+          if [ -z "$RELEASES" ]; then
+            echo "Could not list devkit releases (offline or API error); skipping the staleness report."
+            exit 0
+          fi
+          LATEST="$(printf '%s\n' "$RELEASES" | sort -V | tail -n1)"
+          if [ "$PIN" = "$LATEST" ]; then
+            echo "DEVKIT_VERSION ${PIN} is the latest devkit release."
+            exit 0
+          fi
+          # Count the stable releases strictly newer than the pin. GNU
+          # `sort -V` orders `X.Y.Z-rcN` AFTER `X.Y.Z` (Debian convention, the
+          # opposite of semver), so map the prerelease dash to a tilde — which
+          # version-sorts before the final — and an rc pin counts as behind
+          # its own published final.
+          SORT_PIN="$(printf '%s' "$PIN" | sed 's/-/~/')"
+          BEHIND="$(printf '%s\n%s\n' "$RELEASES" "$SORT_PIN" | sort -uV \
+            | awk -v pin="$SORT_PIN" 'f { c++ } $0 == pin { f = 1 } END { print c + 0 }')"
+          if [ "$BEHIND" -eq 0 ]; then
+            echo "DEVKIT_VERSION ${PIN} is ahead of the latest published release (${LATEST})."
+            exit 0
+          fi
+          echo "::warning::DEVKIT_VERSION ${PIN} is ${BEHIND} release(s) behind the latest devkit release (${LATEST}). Run the devkit-upgrade workflow or 'install.sh --force --version ${LATEST}' to catch up."
+          {
+            echo "## Devkit staleness"
+            echo ""
+            echo "- **Pinned:** \`${PIN}\`"
+            echo "- **Latest:** \`${LATEST}\`"
+            echo "- **Behind:** ${BEHIND} stable release(s)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Blocks PRs that introduce known-vulnerable dependencies, off GitHub's
+  # dependency graph (lockfiles + action pins alike) — no toolchain, no
+  # container, no resolve-toolchain. Doubly guarded, mirroring the codeql.yml
+  # private-repo note: (1) dependency-review-action only works on pull_request,
+  # where it diffs the base and head dependency sets; (2) the dependency-graph
+  # API is unavailable on Free-plan private repos, so private repos get a
+  # skipped (neutral) run instead of a permanently red one, and a repo later
+  # flipped public starts gating automatically with no re-scaffold (#1039).
+  #
+  # First run on a NEW public repo returns 403 if the org disables the dependency
+  # graph for new repos (dependency_graph_enabled_for_new_repositories: false).
+  # Enable it once (repo admin), the same toggle as Settings > Security >
+  # Dependency graph: gh api -X PUT repos/OWNER/REPO/vulnerability-alerts (#1166).
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    if: ${{ github.event_name == 'pull_request' && !github.event.repository.private }}
+    permissions:
+      contents: read
+      pull-requests: write   # post the dependency-review summary comment
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Review dependencies for vulnerabilities
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294  # v5.0.0
+        with:
+          fail-on-severity: high
+
+  # CI extension seam (#1761): a fourth consumer-owned seam, next to the three
+  # release-process ones (release-extension.yml et al.), but called from ci.yml
+  # rather than the release orchestrator. Called UNCONDITIONALLY — no knob, no
+  # `if:` — because a skip-by-default gate reintroduces exactly the silent-skip
+  # failure this issue exists to prevent: a consumer writes real jobs into
+  # ci-extension.yml, forgets to flip a flag, and the job is silently skipped
+  # while red checks merge. The one hosted no-op runner this costs every PR is
+  # the accepted price. `permissions:` stays the same read-only ceiling as the
+  # rest of this workflow; a called reusable workflow can only downgrade it.
+  extension:
+    name: CI Extension
+    needs: [resolve-toolchain]
+    uses: ./.github/workflows/ci-extension.yml
+    permissions:
+      contents: read
+      packages: read
+    with:
+      mode: ${{ needs.resolve-toolchain.outputs.mode }}
+      image: ${{ needs.resolve-toolchain.outputs.image }}
+      image-tag: ${{ needs.resolve-toolchain.outputs.image-tag }}
+      runner-json: ${{ needs.resolve-toolchain.outputs.runner-json }}
+    secrets: inherit
+
+  summary:
+    name: CI Summary
+    runs-on: ${{ fromJSON(needs.resolve-toolchain.outputs.runner-json) }}
+    timeout-minutes: 5
+    needs:
+      [
+        resolve-toolchain,
+        lint,
+        test,
+        commit-checks,
+        scaffold-drift,
+        dependency-review,
+        extension,
+      ]
+    if: always()
+
+    steps:
+      - name: Check results
+        run: |
+          echo "CI Results Summary"
+          echo "==================="
+          echo ""
+          echo "Resolve toolchain: ${{ needs.resolve-toolchain.result }}"
+          echo "Lint: ${{ needs.lint.result }}"
+          echo "Test: ${{ needs.test.result }}"
+          echo "Commit messages: ${{ needs.commit-checks.result }}"
+          echo "Scaffold drift: ${{ needs.scaffold-drift.result }}"
+          echo "Dependency review: ${{ needs.dependency-review.result }}"
+          echo "Extension: ${{ needs.extension.result }}"
+          echo ""
+
+          # Fail on 'failure' AND on 'cancelled': a cancelled job (timeout,
+          # concurrency cancel, runner eviction) produced no verdict, and this
+          # aggregate is the required check — treating it as green would let an
+          # unfinished CI run merge (#1371, #1414). 'skipped' stays tolerated:
+          # push/dispatch runs and PR-only jobs skip legitimately.
+          FAILED=false
+
+          if [ "${{ needs.resolve-toolchain.result }}" = "failure" ] || [ "${{ needs.resolve-toolchain.result }}" = "cancelled" ]; then
+            echo "ERROR: Toolchain resolution failed or was cancelled"
+            FAILED=true
+          fi
+
+          if [ "${{ needs.lint.result }}" = "failure" ] || [ "${{ needs.lint.result }}" = "cancelled" ]; then
+            echo "ERROR: Lint checks failed or were cancelled"
+            FAILED=true
+          fi
+
+          if [ "${{ needs.test.result }}" = "failure" ] || [ "${{ needs.test.result }}" = "cancelled" ]; then
+            echo "ERROR: Tests failed or were cancelled"
+            FAILED=true
+          fi
+
+          if [ "${{ needs.commit-checks.result }}" = "failure" ] || [ "${{ needs.commit-checks.result }}" = "cancelled" ]; then
+            echo "ERROR: Commit message checks failed or were cancelled"
+            FAILED=true
+          fi
+
+          # Skipped on push/dispatch and when DEVKIT_DRIFT_CHECK=false; a
+          # genuine failure (managed-file drift) or a cancel trips the gate.
+          if [ "${{ needs.scaffold-drift.result }}" = "failure" ] || [ "${{ needs.scaffold-drift.result }}" = "cancelled" ]; then
+            echo "ERROR: Scaffold drift detected or check cancelled"
+            FAILED=true
+          fi
+
+          # Skipped on push/dispatch and on private repos (same skip-is-OK
+          # treatment as commit-checks); a genuine failure or a cancel trips
+          # the gate.
+          if [ "${{ needs.dependency-review.result }}" = "failure" ] || [ "${{ needs.dependency-review.result }}" = "cancelled" ]; then
+            echo "ERROR: Dependency review failed or was cancelled"
+            FAILED=true
+          fi
+
+          # Called unconditionally (#1761) — never skipped, so 'failure'/
+          # 'cancelled' are the only non-passing results a consumer can hit.
+          if [ "${{ needs.extension.result }}" = "failure" ] || [ "${{ needs.extension.result }}" = "cancelled" ]; then
+            echo "ERROR: CI extension failed or was cancelled"
+            FAILED=true
+          fi
+
+          if [ "$FAILED" = "true" ]; then
+            echo ""
+            echo "One or more checks failed"
+            exit 1
+          fi
+
+          echo ""
+          echo "All executed checks passed"

@@ -1,0 +1,100 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "timezone": "Etc/UTC",
+  "schedule": ["before 9am on monday"],
+  "baseBranchPatterns": ["main"],
+  "rebaseWhen": "conflicted",
+  "lockFileMaintenance": {
+    "description": "Interim mechanism for transitive npm vulnerability coverage: a weekly lockfile regeneration picks up in-range fixes for indirect dependencies that never appear in package.json. Alert-driven transitive remediation is unimplemented upstream (open idea thread: https://github.com/renovatebot/renovate/discussions/41825) and the former transitiveRemediation option was removed from Renovate. Refs https://github.com/vig-os/devkit/issues/1041.",
+    "enabled": true,
+    "schedule": ["before 9am on monday"]
+  },
+  "vulnerabilityAlerts": {
+    "description": "Renovate is the org's vulnerability-fix channel (Dependabot security updates are off, vig-os/org-config#307). GitHub alerts become forced rules at repo init: vulnerability PRs target baseBranchPatterns, bypass the schedule and keep the per-manager semanticCommitType below, so they pass the commit gate. Only dependencies an enabledManagers entry extracts are covered; transitive dependencies rely on lockFileMaintenance above (https://github.com/vig-os/devkit/issues/1041). Refs https://github.com/vig-os/devkit/issues/1763.",
+    "labels": ["security"]
+  },
+  "gitIgnoredAuthors": ["41898282+github-actions[bot]@users.noreply.github.com"],
+  "packageRules": [
+    {
+      "description": "GitHub Actions — semantic commit + group minor/patch",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "github-actions (minor and patch)",
+      "semanticCommitType": "ci",
+      "semanticCommitScope": "actions"
+    },
+    {
+      "description": "GitHub Actions — major updates stay separate",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["major"],
+      "semanticCommitType": "ci",
+      "semanticCommitScope": "actions"
+    },
+    {
+      "description": "Python (PEP 621) — always pin ranges",
+      "matchManagers": ["pep621"],
+      "rangeStrategy": "pin",
+      "semanticCommitType": "build",
+      "semanticCommitScope": "pip"
+    },
+    {
+      "description": "requires-python is a deliberate range: the Nix toolchain pins the exact interpreter via flake.lock, so an == pin is redundant and unsatisfiable against nixpkgs. Exempt it from the pin rule above. Refs #666.",
+      "matchManagers": ["pep621"],
+      "matchDepTypes": ["requires-python"],
+      "enabled": false
+    },
+    {
+      "description": "Python — group minor/patch",
+      "matchManagers": ["pep621"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "python (minor and patch)"
+    },
+    {
+      "description": "npm",
+      "matchManagers": ["npm"],
+      "semanticCommitType": "build",
+      "semanticCommitScope": "npm"
+    },
+    {
+      "description": "npm — group dev dependencies (they never ship in the bundle)",
+      "matchManagers": ["npm"],
+      "matchDepTypes": ["devDependencies"],
+      "groupName": "npm dev dependencies"
+    },
+    {
+      "description": "npm — group runtime minor/patch; majors stay separate",
+      "matchManagers": ["npm"],
+      "matchDepTypes": ["dependencies"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "npm (minor and patch)"
+    },
+    {
+      "description": "Rust (Cargo)",
+      "matchManagers": ["cargo"],
+      "semanticCommitType": "build",
+      "semanticCommitScope": "cargo"
+    },
+    {
+      "description": "Devkit-managed workflows and composite actions are regenerated wholesale on every devkit upgrade, so their SHA-pinned action digests are advanced upstream by devkit's own Renovate and shipped with each devkit release — never here. Disabling them stops duplicate/clobbering pin-bump PRs in consumer repos. This rule is intentionally last so a consumer's own later packageRules (in their preserved renovate.json) win: a consumer that wants to manage a specific managed file can re-enable it there. Refs vig-os/devkit#1332.",
+      "matchFileNames": [
+        ".github/workflows/abandon-release.yml",
+        ".github/workflows/ci.yml",
+        ".github/workflows/codeql.yml",
+        ".github/workflows/devkit-upgrade.yml",
+        ".github/workflows/prepare-hotfix.yml",
+    ".github/workflows/prepare-release.yml",
+        ".github/workflows/promote-release.yml",
+        ".github/workflows/release-core.yml",
+        ".github/workflows/release-publish.yml",
+        ".github/workflows/release.yml",
+        ".github/workflows/scorecard.yml",
+        ".github/workflows/sync-issues.yml",
+        ".github/workflows/sync-main-to-dev.yml",
+        ".github/actions/setup-devkit-toolchain/**",
+        ".github/actions/resolve-toolchain/**"
+      ],
+      "enabled": false
+    }
+  ]
+}

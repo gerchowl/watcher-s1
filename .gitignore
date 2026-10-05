@@ -1,0 +1,46 @@
+# Managed by vigOS devkit — regenerated on upgrade; local edits are lost.
+# Customize in justfile.project. Bugs / missing tools: https://github.com/vig-os/devkit/issues
+
+# Language-neutral base .gitignore
+#
+# This is a MANAGED scaffold file: init-workspace.sh overwrites it on every
+# upgrade and appends a per-language fragment (Python / Node / Rust) detected
+# from the repo's marker files (pyproject.toml / package.json / Cargo.toml).
+# Do not hand-edit durable ignores here — they will not survive an upgrade.
+# Put repo-specific root ignores in .gitignore.project (preserved on upgrade);
+# init-workspace.sh appends its contents here on every regeneration (#1092).
+
+# Environments
+.env
+# .envrc (use flake) is committed for nix-direnv onboarding (#640); the local
+# evaluation cache and any per-user overrides are not.
+.direnv/
+.envrc.local
+
+# Editors / IDEs (uncomment to ignore local editor state)
+# .idea/
+# .vscode/
+
+# Personal justfile recipes
+justfile.local
+
+# Pre-commit cache
+.pre-commit-cache/
+
+# process-compose / services-flake local dev services state (#795)
+data/
+
+# Repo-specific root .gitignore entries — yours to edit; upgrades never
+# overwrite this file. This is the durable committed home for repo-ROOT ignores:
+# git honors a root ignore only from the root .gitignore, which devkit
+# regenerates on every upgrade, so entries added HERE are appended to that
+# regenerated .gitignore and survive. Put durable repo-root ignores below (not
+# in the managed .gitignore, where hand edits are lost).
+#
+# Examples (uncomment / add your own):
+#   /scratch/
+#   /secrets.local.yaml
+
+# flake-hooks opt-in (#1092): the generated .pre-commit-config.yaml is a
+# /nix/store symlink — never commit it.
+.pre-commit-config.yaml

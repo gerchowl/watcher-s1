@@ -1,0 +1,23 @@
+# Seeded by vigOS devkit — yours to edit; upgrades never overwrite this file.
+# Bugs / missing tools: https://github.com/vig-os/devkit/issues
+
+# Typos configuration
+# https://github.com/crate-ci/typos
+
+[default.extend-words]
+# Shell scripting: sed label syntax uses 'ba' (branch to label 'a')
+ba = "ba"
+# CVE policy term (#637): a finding "unexcepted" = not in the exception register
+unexcepted = "unexcepted"
+# version-check.sh duration placeholder (#759): 'Nd' = N days (cf. Nw/Nh/Nm)
+Nd = "Nd"
+# podman rootless-networking helper package name (#1106), not a misspelling
+passt = "passt"
+# Vendored guardrails gates (#1488). All three are false positives in shell:
+# `tatus` is the tail of the regex class `[Ss]tatus:`, `fnd` is a shell
+# function name in the test harness, and `mis-attributes` is a real word.
+# Added as words rather than excluding assets/guardrails/ wholesale, so the
+# prose in those files stays spell-checked.
+tatus = "tatus"
+fnd = "fnd"
+mis = "mis"

@@ -1,0 +1,24 @@
+// Managed by vigOS devkit — regenerated on upgrade; local edits are lost.
+// Customize in justfile.project. Bugs / missing tools: https://github.com/vig-os/devkit/issues
+
+{
+  "files.associations": {
+    "justfile": "just",
+    "Justfile": "just",
+    "justfile.*": "just"
+  },
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python3",
+  "[python]": {
+    "editor.defaultFormatter": "charliermarsh.ruff",
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+      "source.organizeImports": "explicit",
+      "source.fixAll": "explicit"
+    }
+  },
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/*.pyc": true,
+    "**/.pytest_cache": true
+  }
+}
