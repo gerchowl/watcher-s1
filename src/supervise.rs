@@ -601,7 +601,8 @@ impl<'a> Watch<'a> {
 }
 
 /// The writer thread for our own stdout/stderr, behind a bounded queue
-/// (64 chunks of at most 64 KiB).
+/// (8 chunks of at most 64 KiB: enough to keep the child streaming, small
+/// enough that the final flush to a slow reader stays short).
 struct Tee {
     tx: mpsc::SyncSender<(RawFd, Vec<u8>)>,
     handle: std::thread::JoinHandle<()>,
@@ -609,7 +610,7 @@ struct Tee {
 
 impl Tee {
     fn start() -> Self {
-        let (tx, rx) = mpsc::sync_channel::<(RawFd, Vec<u8>)>(64);
+        let (tx, rx) = mpsc::sync_channel::<(RawFd, Vec<u8>)>(8);
         let handle = std::thread::spawn(move || {
             for (fd, data) in rx {
                 write_all_fd(fd, &data);
@@ -627,13 +628,44 @@ impl Tee {
         }
     }
 
-    fn send(&self, chunk: (RawFd, Vec<u8>)) {
-        let _ = self.tx.send(chunk);
+    /// Queue, waiting for room until `deadline`; past it the chunk comes back.
+    fn send_until(&self, mut chunk: (RawFd, Vec<u8>), deadline: Instant) -> Result<(), (RawFd, Vec<u8>)> {
+        loop {
+            match self.try_send(chunk) {
+                Ok(()) => return Ok(()),
+                Err(back) if Instant::now() >= deadline => return Err(back),
+                Err(back) => {
+                    chunk = back;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
     }
 
-    /// Flush everything queued (like a process blocking on its last write).
-    fn finish(self) {
+    /// Flush everything queued, like a process blocking on its last write,
+    /// but give up when INT/TERM/HUP/QUIT arrives on the signal pipe: being
+    /// told to stop beats delivering the rest to a reader that is not reading.
+    fn finish(self, sig_r: RawFd) {
         drop(self.tx);
+        let mut sb = [0u8; 64];
+        while !self.handle.is_finished() {
+            let mut p = libc::pollfd {
+                fd: sig_r,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            unsafe { libc::poll(&mut p, 1, 20) };
+            while let Some(n) = read_some(sig_r, &mut sb).filter(|n| *n > 0) {
+                if sb[..n].iter().any(|&s| {
+                    matches!(
+                        s as libc::c_int,
+                        libc::SIGINT | libc::SIGTERM | libc::SIGHUP | libc::SIGQUIT
+                    )
+                }) {
+                    return; // the writer thread dies with the process
+                }
+            }
+        }
         let _ = self.handle.join();
     }
 }
@@ -801,11 +833,10 @@ pub fn run(opts: Options) -> Outcome {
         // never stops reading because the queue is full.
         let draining = status.is_some();
         if let Some(h) = held.take() {
-            if draining {
-                tee.send(h);
-            } else {
-                held = tee.try_send(h).err();
-            }
+            held = match drain_cap {
+                Some(cap) if draining => tee.send_until(h, cap).err(),
+                _ => tee.try_send(h).err(),
+            };
         }
         // Poll set: signal pipe, open outputs (unless backpressured), stdin
         // when forwarding.
@@ -875,15 +906,22 @@ pub fn run(opts: Options) -> Outcome {
         let mut got_output = false;
         'outputs: for (i, (fd, is_err)) in sp.outputs.iter().enumerate() {
             while open[i] && held.is_none() {
+                // The drain is bounded even while data keeps coming (a
+                // grandchild writing faster than our reader consumes).
+                if drain_cap.is_some_and(|c| Instant::now() >= c) {
+                    break 'outputs;
+                }
                 match read_some(fd.as_raw_fd(), &mut buf) {
                     Some(0) => break,
                     Some(n) => {
                         got_output = true;
                         w.on_output(&buf[..n]);
                         let chunk = (if *is_err { 2 } else { 1 }, buf[..n].to_vec());
-                        if draining {
-                            tee.send(chunk);
-                        } else if let Err(back) = tee.try_send(chunk) {
+                        let sent = match drain_cap {
+                            Some(cap) if draining => tee.send_until(chunk, cap),
+                            _ => tee.try_send(chunk),
+                        };
+                        if let Err(back) = sent {
                             held = Some(back);
                             break 'outputs;
                         }
@@ -943,8 +981,9 @@ pub fn run(opts: Options) -> Outcome {
             }
         }
         // Leave once every output is closed, or once the grace for new data
-        // is over AND a full read pass found nothing: bytes already in the
-        // pipes are always teed, however slow our reader is.
+        // is over AND a full read pass found nothing, or at the 3 s cap. So
+        // the output a child leaves behind is teed even behind a slow reader,
+        // and a grandchild that writes forever is cut off at the cap.
         if status.is_some()
             && (open.iter().all(|o| !o)
                 || (drain_until.is_some_and(|d| now >= d) && !got_output && held.is_none())
@@ -954,10 +993,10 @@ pub fn run(opts: Options) -> Outcome {
         }
     }
 
-    if let Some(h) = held.take() {
-        tee.send(h);
-    }
-    tee.finish();
+    // A chunk still held when the cap hit is dropped: the cap bounds the
+    // drain, documented as such. What is queued gets flushed below.
+    drop(held);
+    tee.finish(sig_r.as_raw_fd());
     let Some(st) = status else {
         log(opts.quiet, "lost the child's exit status");
         return Outcome::Code(1);
