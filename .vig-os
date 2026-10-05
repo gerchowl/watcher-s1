@@ -39,7 +39,7 @@ DEVKIT_MODULES=""
 # for devkit or existing consumers). Action-publishing repos set `v` for the
 # `actions/checkout@v5` ecosystem convention (#1044). The `version` input, the
 # `release/X.Y.Z` branch name, and the `## [X.Y.Z]` freeze heading stay bare.
-DEVKIT_TAG_PREFIX=
+DEVKIT_TAG_PREFIX=v
 
 # Candidate pre-release format for `release.yml` (#1746). Empty (default) =>
 # `rc{N}`, i.e. today's X.Y.Z-rcN tags (no change for devkit or existing
@@ -144,7 +144,7 @@ DEVKIT_COMMIT_APP_ENVIRONMENT=
 # DEVKIT_SYNC_TARGET mirror's only fold-back to the trunk (#1758). Governs
 # scaffold SHAPE only, not the flake — an unknown name aborts the scaffold
 # loudly (#1284).
-DEVKIT_FEATURES_DISABLED=release,sync-issues,skills,worktree,gh-templates
+DEVKIT_FEATURES_DISABLED=sync-issues,skills,worktree,gh-templates
 
 # License the scaffold ships: apache-2.0 (default) | proprietary | none. Empty
 # (= unset) resolves to `apache-2.0` — the shipped Apache-2.0 template, adding
