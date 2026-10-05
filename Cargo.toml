@@ -1,0 +1,26 @@
+[package]
+name = "watcher-s1"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Truthful command wrapper that detects stalls, prompts and masked failures"
+license = "Apache-2.0"
+repository = "https://github.com/gerchowl/watcher-s1"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+libc = "0.2.190"
+nix = { version = "0.31.3", features = ["process", "signal", "term", "poll", "fs", "resource", "hostname", "ioctl"] }
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+toml = { version = "1.1.6", features = ["preserve_order"] }
+
+[dev-dependencies]
+jsonschema = { version = "0.58.5", default-features = false }
+tempfile = "3.27.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

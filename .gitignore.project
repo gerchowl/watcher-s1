@@ -8,3 +8,7 @@
 # Examples (uncomment / add your own):
 #   /scratch/
 #   /secrets.local.yaml
+
+/target/
+/result
+/result-*

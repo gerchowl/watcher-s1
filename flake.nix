@@ -47,8 +47,49 @@
         #   ];
         # ────────────────────────────────────────────────────────────────────
         extraPackages = pkgs: [
-          # add project tools here
+          # Rust toolchain (stable, from the pinned nixpkgs): watcher-s1 is a
+          # Rust binary, devkit ships no Rust.
+          pkgs.cargo
+          pkgs.rustc
+          pkgs.rustfmt
+          pkgs.clippy
+          pkgs.rust-analyzer
         ];
+
+        # The watcher-s1 binary, built from plain nixpkgs (no devkit overlay)
+        # so consumers (g-fleet) get a closure without the dev toolchain. One
+        # binary whose only runtime dependency is libc. (Not pkgsStatic: musl
+        # rustc/gcc are not in the binary cache, so every consumer would
+        # build a compiler from source.)
+        watcherPkgs = nixpkgs.legacyPackages.${system};
+        cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+        watcher-s1 = watcherPkgs.rustPlatform.buildRustPackage {
+          pname = cargoToml.package.name;
+          inherit (cargoToml.package) version;
+          src = nixpkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = nixpkgs.lib.fileset.unions [
+              ./Cargo.toml
+              ./Cargo.lock
+              ./src
+              ./tests
+              ./questions
+              ./event.schema.json
+            ];
+          };
+          cargoLock.lockFile = ./Cargo.lock;
+          # The integration tests drive PTYs, signals and process groups,
+          # which the Nix build sandbox does not reliably provide (no
+          # controlling terminal, darwin sandbox). They run in CI via
+          # `just test` instead.
+          doCheck = false;
+          meta = {
+            description = "Truthful command wrapper that detects stalls, prompts and masked failures";
+            homepage = "https://github.com/gerchowl/watcher-s1";
+            license = nixpkgs.lib.licenses.asl20;
+            mainProgram = "watcher-s1";
+          };
+        };
 
         # Devkit knobs read from .vig-os (#1224, #1432, #1431, #1282, #1633): the
         # flake-generated pre-commit hooks — the branch guard and the
@@ -127,7 +168,25 @@
             # building the committed YAML remote pre-commit repo hook envs
             # per runner. Customize like the opt-in block below; the generated
             # config is a gitignored /nix/store symlink.
-            hooks = { };
+            hooks = {
+              # Rust gates, run by `just precommit` (and so by CI's lint job).
+              cargo-fmt = {
+                enable = true;
+                name = "cargo fmt --check";
+                entry = "cargo fmt --all -- --check";
+                files = "\\.rs$";
+                language = "system";
+                pass_filenames = false;
+              };
+              cargo-clippy = {
+                enable = true;
+                name = "cargo clippy -D warnings";
+                entry = "cargo clippy --all-targets --locked -- -D warnings";
+                files = "(\\.rs$|^Cargo\\.(toml|lock)$)";
+                language = "system";
+                pass_filenames = false;
+              };
+            };
 
             # Opt-in: let the flake GENERATE .pre-commit-config.yaml from the
             # shared base hook set instead of hand-managing the scaffolded
@@ -178,6 +237,16 @@
             inherit refsOptionalTypes;
           }
         );
+
+        packages = {
+          inherit watcher-s1;
+          default = watcher-s1;
+        };
+
+        apps.default = {
+          type = "app";
+          program = "${watcher-s1}/bin/watcher-s1";
+        };
 
         # Opt-in local dev services (#795): a daemonless process-compose stack
         # (Postgres, SeaweedFS/S3, Redis, …) with service versions from the

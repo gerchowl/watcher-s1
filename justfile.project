@@ -30,14 +30,16 @@ info:
 # (#1478). Whether the skip is legitimate is asserted once in CI, against the
 # languages this repo declares in .vig-os (DEVKIT_LANGUAGES).
 
-# Run all linters
+# Run all linters (Rust: rustfmt check + clippy with warnings as errors)
 [group('quality')]
 lint:
+    @if [ -f Cargo.toml ]; then cargo fmt --all -- --check && cargo clippy --all-targets --locked -- -D warnings; fi
     @if [ -f pyproject.toml ]; then uv run ruff check .; else echo "just lint: no pyproject.toml — skipping"; fi
 
 # Format code
 [group('quality')]
 format:
+    @if [ -f Cargo.toml ]; then cargo fmt --all; fi
     @if [ -f pyproject.toml ]; then uv run ruff format .; else echo "just format: no pyproject.toml — skipping"; fi
 
 # Run pre-commit hooks on all files
@@ -53,8 +55,11 @@ precommit:
 # repo has no tests/ directory — a fresh scaffold. Once a test directory exists,
 # zero collected is a signal, not a no-op, so it propagates (#1281 narrowed by
 # #1478).
+# Rust: `cargo test --locked`. The real System One checks (tests/kev.rs) only
+# run when SYSTEMONE_URL is set; see `test-kev`.
 [group('test')]
 test *args:
+    @if [ -f Cargo.toml ]; then cargo test --locked {{ args }}; fi
     @if [ ! -f pyproject.toml ]; then echo "just test: no pyproject.toml — skipping"; elif uv run pytest {{ args }}; then :; else rc=$?; if [ "$rc" -eq 5 ] && [ ! -d tests ]; then echo "just test: no tests collected and no tests/ directory — skipping"; else exit "$rc"; fi; fi
 
 # Run tests with coverage (same exit-5 rule as `test` above)
@@ -81,10 +86,27 @@ update:
 # BUILD
 # -------------------------------------------------------------------------------
 
+# Build the release binary
+[group('build')]
+build:
+    cargo build --release --locked
+
+# Build the flake package (what g-fleet consumes)
+[group('build')]
+nix-build:
+    nix build .#default
+
+# Run the opt-in real System One checks, strictly sequentially
+[group('test')]
+test-kev url=env("SYSTEMONE_URL", ""):
+    @if [ -z "{{ url }}" ]; then echo "just test-kev: set SYSTEMONE_URL or pass url=..." >&2; exit 2; fi
+    SYSTEMONE_URL="{{ url }}" cargo test --locked --test kev -- --nocapture --test-threads=1
+
 # Clean build artifacts
 [group('build')]
 clean-artifacts:
-    rm -rf .pytest_cache .ruff_cache .coverage htmlcov dist build *.egg-info
+    rm -rf .pytest_cache .ruff_cache .coverage htmlcov dist build *.egg-info result
+    @if [ -f Cargo.toml ]; then cargo clean; fi
     find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
 # ===============================================================================
