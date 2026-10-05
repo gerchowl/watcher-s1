@@ -4,6 +4,7 @@ use watcher_s1::breaker::{Breaker, default_state_dir};
 use watcher_s1::cli::{Cli, S1Args, Sub};
 use watcher_s1::config::{self, S1Config};
 use watcher_s1::event::Sink;
+use watcher_s1::judge;
 use watcher_s1::questions::QuestionSet;
 use watcher_s1::s1::Client;
 use watcher_s1::supervise::{self, Options, log};
@@ -63,6 +64,10 @@ fn print_config(args: &S1Args) -> i32 {
 fn main() {
     let cli = Cli::parse();
     match cli.sub {
+        Some(Sub::Judge(j)) => {
+            // Silent by design: stderr from a hook only reaches a debug log.
+            judge::run_posttooluse(client(&j.s1, true))
+        }
         Some(Sub::Config(a)) => std::process::exit(print_config(&a)),
         None => {}
     }

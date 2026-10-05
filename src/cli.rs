@@ -45,8 +45,19 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Sub {
+    /// Judge a finished command (Claude Code hook mode).
+    Judge(JudgeArgs),
     /// Print the resolved System One configuration and where each value came from.
     Config(S1Args),
+}
+
+#[derive(Debug, Args)]
+pub struct JudgeArgs {
+    /// Read a Claude Code PostToolUse hook payload on stdin.
+    #[arg(long, required = true)]
+    pub posttooluse: bool,
+    #[command(flatten)]
+    pub s1: S1Args,
 }
 
 #[derive(Debug, Args, Clone, Default)]
@@ -147,5 +158,14 @@ mod tests {
         // A command that looks like a flag still belongs to the child.
         let c = Cli::try_parse_from(["watcher-s1", "--", "judge", "--posttooluse"]).unwrap();
         assert_eq!(c.wrap.cmd, ["judge", "--posttooluse"]);
+    }
+
+    #[test]
+    fn judge_subcommand() {
+        let c = Cli::try_parse_from(["watcher-s1", "judge", "--posttooluse", "--s1-url", "http://h:1/x"]).unwrap();
+        match c.sub {
+            Some(Sub::Judge(j)) => assert_eq!(j.s1.s1_url, ["http://h:1/x"]),
+            other => panic!("{other:?}"),
+        }
     }
 }
