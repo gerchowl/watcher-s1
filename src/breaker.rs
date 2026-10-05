@@ -7,8 +7,10 @@
 //! best-effort: an unreadable or unwritable file degrades to "closed".
 //!
 //! Closed: count consecutive failures; at `fails` the breaker opens for
-//! `cooldown`. After the cooldown one call is let through (half-open): a
-//! success closes it, a failure reopens it for another cooldown.
+//! `cooldown`. After the cooldown exactly one caller, across all processes,
+//! claims the trial call (half-open): claiming re-arms the cooldown, so
+//! everyone else keeps skipping; a success closes the breaker, a failure
+//! reopens it. Read-modify-write runs under an `flock` on `breaker.lock`.
 
 use crate::config::BreakerConfig;
 use serde::{Deserialize, Serialize};
@@ -73,6 +75,36 @@ impl Breaker {
             .unwrap_or_default()
     }
 
+    /// Run `f` on the state under an exclusive lock (best effort: if the
+    /// lock cannot be had within ~200 ms, run unlocked rather than stall).
+    fn locked<T>(&self, f: impl FnOnce(&mut BTreeMap<String, Entry>) -> (T, bool)) -> T {
+        let lock = self.path.as_ref().and_then(|p| {
+            let dir = p.parent()?;
+            std::fs::create_dir_all(dir).ok()?;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(dir.join("breaker.lock"))
+                .ok()?;
+            use std::os::fd::AsRawFd;
+            for _ in 0..20 {
+                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                    return Some(file); // released when dropped (closed)
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            None
+        });
+        let mut m = self.load();
+        let (out, dirty) = f(&mut m);
+        if dirty {
+            self.store(&m);
+        }
+        drop(lock);
+        out
+    }
+
     fn store(&self, m: &BTreeMap<String, Entry>) {
         let Some(p) = &self.path else { return };
         let Some(dir) = p.parent() else { return };
@@ -88,29 +120,38 @@ impl Breaker {
         }
     }
 
-    /// May we call `url` now? (closed, or open but past its cooldown)
-    pub fn allow(&self, url: &str) -> bool {
-        match self.load().get(url) {
-            Some(e) => e.open_until <= (self.now)(),
-            None => true,
-        }
+    /// May we call `url` now? Closed: yes. Open: no, unless the cooldown is
+    /// over and we are the one caller that claims the half-open trial.
+    pub fn acquire(&self, url: &str) -> bool {
+        let now = (self.now)();
+        let cooldown = self.cfg.cooldown.as_secs_f64();
+        let fails = self.cfg.fails;
+        self.locked(|m| match m.get_mut(url) {
+            None => (true, false),
+            Some(e) if e.fails < fails => (true, false),
+            Some(e) if e.open_until > now => (false, false),
+            Some(e) => {
+                e.open_until = now + cooldown; // claim the trial
+                (true, true)
+            }
+        })
     }
 
     pub fn record(&self, url: &str, ok: bool) {
-        let mut m = self.load();
-        if ok {
-            if m.remove(url).is_some() {
-                self.store(&m);
-            }
-            return;
-        }
         let now = (self.now)();
-        let e = m.entry(url.to_string()).or_default();
-        e.fails = e.fails.saturating_add(1);
-        if e.fails >= self.cfg.fails {
-            e.open_until = now + self.cfg.cooldown.as_secs_f64();
-        }
-        self.store(&m);
+        let cooldown = self.cfg.cooldown.as_secs_f64();
+        let fails = self.cfg.fails;
+        self.locked(|m| {
+            if ok {
+                return ((), m.remove(url).is_some());
+            }
+            let e = m.entry(url.to_string()).or_default();
+            e.fails = e.fails.saturating_add(1);
+            if e.fails >= fails {
+                e.open_until = now + cooldown;
+            }
+            ((), true)
+        })
     }
 }
 
@@ -134,26 +175,28 @@ mod tests {
         let u = "http://a/x";
         for _ in 0..2 {
             b.record(u, false);
-            assert!(b.allow(u));
+            assert!(b.acquire(u));
         }
         b.record(u, false);
-        assert!(!b.allow(u), "open after 3 consecutive failures");
-        assert!(b.allow("http://other/x"), "per endpoint");
+        assert!(!b.acquire(u), "open after 3 consecutive failures");
+        assert!(b.acquire("http://other/x"), "per endpoint");
 
         // A second process sees the same state.
         let c2 = clock.clone();
         let b2 = Breaker::with_clock(t.path(), cfg, move || c2.load(Ordering::SeqCst) as f64);
-        assert!(!b2.allow(u));
+        assert!(!b2.acquire(u));
 
         clock.store(1601, Ordering::SeqCst);
-        assert!(b.allow(u), "half-open after cooldown");
+        assert!(b.acquire(u), "half-open after cooldown: one trial call");
+        assert!(!b2.acquire(u), "only one caller gets the trial");
         b.record(u, false);
-        assert!(!b.allow(u), "a half-open failure reopens");
+        assert!(!b.acquire(u), "a half-open failure reopens");
         clock.store(2300, Ordering::SeqCst);
+        assert!(b.acquire(u));
         b.record(u, true);
-        assert!(b.allow(u));
+        assert!(b2.acquire(u), "success closed it for everyone");
         b.record(u, false);
-        assert!(b.allow(u), "success reset the count");
+        assert!(b.acquire(u), "success reset the count");
     }
 
     #[test]
@@ -165,6 +208,6 @@ mod tests {
         for _ in 0..5 {
             b.record("http://a/x", false);
         }
-        assert!(b.allow("http://a/x"));
+        assert!(b.acquire("http://a/x"));
     }
 }
