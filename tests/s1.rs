@@ -5,6 +5,8 @@
 mod common;
 use common::*;
 use serde_json::{Value, json};
+use std::io::Write;
+use std::process::Stdio;
 use std::time::Duration;
 
 fn cfg(e: &Env, urls: &[&str], extra: &str) -> std::path::PathBuf {
@@ -272,4 +274,114 @@ fn config_subcommand_reports_sources() {
     assert_eq!(v["timeout_s"], 2.0);
     assert_eq!(v["timeout_source"], "cli");
     assert_eq!(v["questions_ok"], true);
+}
+
+// --- judge --posttooluse -----------------------------------------------------
+
+fn judge(e: &Env, url: Option<&str>, input: &Value) -> Run {
+    let mut c = std::process::Command::new(BIN);
+    c.env_remove("SYSTEMONE_URL")
+        .env("XDG_CONFIG_HOME", e.path("xdg"))
+        .env("WATCHER_S1_STATE_DIR", e.path("state"))
+        .args(["judge", "--posttooluse"]);
+    if let Some(u) = url {
+        c.args(["--s1-url", u]);
+    }
+    c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let t0 = std::time::Instant::now();
+    let mut ch = c.spawn().unwrap();
+    ch.stdin
+        .take()
+        .unwrap()
+        .write_all(input.to_string().as_bytes())
+        .unwrap();
+    let o = ch.wait_with_output().unwrap();
+    Run {
+        status: o.status,
+        stdout: o.stdout,
+        stderr: String::from_utf8_lossy(&o.stderr).into(),
+        elapsed: t0.elapsed(),
+    }
+}
+
+fn bash_input(cmd: &str, stdout: &str) -> Value {
+    json!({
+        "session_id": "s", "transcript_path": "/tmp/t.jsonl", "cwd": "/tmp",
+        "permission_mode": "default", "hook_event_name": "PostToolUse",
+        "tool_name": "Bash", "tool_use_id": "toolu_1", "duration_ms": 10,
+        "tool_input": {"command": cmd, "description": "d", "timeout": 120000},
+        "tool_response": {"stdout": stdout, "stderr": "", "interrupted": false, "isImage": false}
+    })
+}
+
+const FAILING_OUT: &str = "running 2 tests\ntest a ... ok\ntest b ... FAILED\n\nfailures:\n    b\n\ntest result: FAILED. 1 passed; 1 failed\nerror: test failed, to rerun pass `--lib`\n";
+
+#[test]
+fn judge_flags_a_masked_pipe() {
+    let s1 = FakeS1::start(Reply::Answers {
+        failing: 0.97,
+        clean_done: 0.02,
+    });
+    let e = Env::new();
+    let r = judge(
+        &e,
+        Some(&s1.url),
+        &bash_input("cargo test 2>&1 | tail -20", FAILING_OUT),
+    );
+    assert!(r.status.success());
+    let v: Value = serde_json::from_slice(&r.stdout).unwrap();
+    assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+    let ctx = v["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+    assert!(ctx.contains("exit 0 came from the pipe"), "{ctx}");
+    assert!(ctx.contains("error: test failed, to rerun pass `--lib`"), "{ctx}");
+    assert_eq!(s1.hits(), 1);
+    assert!(
+        s1.bodies.lock().unwrap()[0]["state"]
+            .as_str()
+            .unwrap()
+            .starts_with("Command: cargo test 2>&1 | tail -20\n")
+    );
+}
+
+#[test]
+fn judge_is_silent_below_threshold_unpiped_or_without_endpoint() {
+    let low = FakeS1::start(Reply::Answers {
+        failing: 0.4,
+        clean_done: 0.6,
+    });
+    let e = Env::new();
+    for (url, cmd) in [
+        (Some(low.url.as_str()), "cargo test | tail"),
+        (Some(low.url.as_str()), "cargo test"),
+        (None, "cargo test | tail"),
+    ] {
+        let r = judge(&e, url, &bash_input(cmd, FAILING_OUT));
+        assert!(r.status.success());
+        assert!(r.stdout.is_empty(), "{cmd}: {}", r.out());
+        assert!(r.stderr.is_empty(), "{cmd}: {}", r.stderr);
+    }
+    assert_eq!(low.hits(), 1, "only the piped command is judged");
+}
+
+#[test]
+fn judge_fails_open_inside_its_budget() {
+    let hang = FakeS1::start(Reply::Hang);
+    let e = Env::new();
+    let r = judge(&e, Some(&hang.url), &bash_input("make 2>&1 | tail", FAILING_OUT));
+    assert!(r.status.success());
+    assert!(r.stdout.is_empty());
+    assert!(r.elapsed < Duration::from_millis(3200), "{:?}", r.elapsed);
+}
+
+#[test]
+fn judge_survives_garbage_input() {
+    let mut c = std::process::Command::new(BIN);
+    c.args(["judge", "--posttooluse"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    let mut ch = c.spawn().unwrap();
+    ch.stdin.take().unwrap().write_all(b"not json").unwrap();
+    let o = ch.wait_with_output().unwrap();
+    assert!(o.status.success());
+    assert!(o.stdout.is_empty());
 }

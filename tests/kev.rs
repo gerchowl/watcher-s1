@@ -10,6 +10,9 @@
 
 mod common;
 use common::*;
+use serde_json::json;
+use std::io::Write;
+use std::process::Stdio;
 
 #[test]
 fn real_system_one_sequential() {
@@ -58,4 +61,38 @@ fn real_system_one_sequential() {
     let (f_summary, f_clean) = (fused_of(summary), fused_of(clean));
     eprintln!("fused: failing summary {f_summary:.3}, clean summary {f_clean:.3}");
     assert!(f_summary > f_clean + 0.2);
+
+    // 2. Judge hook on a piped command whose output is clean: no output.
+    let judge = |cmd: &str, out: &str| {
+        let mut c = std::process::Command::new(BIN);
+        c.env("SYSTEMONE_URL", &url)
+            .env("WATCHER_S1_STATE_DIR", e.path("state"))
+            .args(["judge", "--posttooluse"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        let mut ch = c.spawn().unwrap();
+        let input = json!({
+            "hook_event_name": "PostToolUse", "tool_name": "Bash",
+            "tool_input": {"command": cmd},
+            "tool_response": {"stdout": out, "stderr": "", "interrupted": false, "isImage": false}
+        });
+        ch.stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+        let o = ch.wait_with_output().unwrap();
+        assert!(o.status.success());
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    let quiet = judge("cargo test 2>&1 | tail -20", clean);
+    let summary_out = judge("cargo test 2>&1 | tail -20", summary);
+    eprintln!("judge on a failing test summary: {summary_out:?}");
+    eprintln!("judge on clean output: {quiet:?}");
+    assert!(quiet.is_empty());
+
+    // 3. Judge hook on the failing output: flagged with evidence.
+    let flagged = judge("cargo build 2>&1 | tail -20", failing);
+    eprintln!("judge on failing output: {flagged}");
+    assert!(flagged.contains("exit 0 came from the pipe"));
 }
