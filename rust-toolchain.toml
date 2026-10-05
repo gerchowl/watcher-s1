@@ -1,0 +1,7 @@
+# The Rust toolchain for the dev shell, the checks and the package
+# (vigos.lib.mkRustProject resolves it through fenix). Bump the channel and
+# update `toolchainHash` in flake.nix together.
+[toolchain]
+channel = "1.95.0"
+profile = "minimal"
+components = ["rustfmt", "clippy", "rust-src", "rust-analyzer"]

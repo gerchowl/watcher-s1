@@ -47,48 +47,23 @@
         #   ];
         # ────────────────────────────────────────────────────────────────────
         extraPackages = pkgs: [
-          # Rust toolchain (stable, from the pinned nixpkgs): watcher-s1 is a
-          # Rust binary, devkit ships no Rust.
-          pkgs.cargo
-          pkgs.rustc
-          pkgs.rustfmt
-          pkgs.clippy
-          pkgs.rust-analyzer
+          # add project tools here (the Rust toolchain comes from `rust`)
         ];
 
-        # The watcher-s1 binary, built from plain nixpkgs (no devkit overlay)
-        # so consumers (g-fleet) get a closure without the dev toolchain. One
-        # binary whose only runtime dependency is libc. (Not pkgsStatic: musl
-        # rustc/gcc are not in the binary cache, so every consumer would
-        # build a compiler from source.)
-        watcherPkgs = nixpkgs.legacyPackages.${system};
-        cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
-        watcher-s1 = watcherPkgs.rustPlatform.buildRustPackage {
-          pname = cargoToml.package.name;
-          inherit (cargoToml.package) version;
-          src = nixpkgs.lib.fileset.toSource {
-            root = ./.;
-            fileset = nixpkgs.lib.fileset.unions [
-              ./Cargo.toml
-              ./Cargo.lock
-              ./src
-              ./tests
-              ./questions
-              ./event.schema.json
-            ];
-          };
-          cargoLock.lockFile = ./Cargo.lock;
-          # The integration tests drive PTYs, signals and process groups,
-          # which the Nix build sandbox does not reliably provide (no
-          # controlling terminal, darwin sandbox). They run in CI via
-          # `just test` instead.
-          doCheck = false;
-          meta = {
-            description = "Truthful command wrapper that detects stalls, prompts and masked failures";
-            homepage = "https://github.com/gerchowl/watcher-s1";
-            license = nixpkgs.lib.licenses.asl20;
-            mainProgram = "watcher-s1";
-          };
+        # The Rust pack (vigos.lib.mkRustProject): the toolchain pinned by
+        # rust-toolchain.toml (fenix), crane-built checks (clippy, fmt,
+        # nextest, doctest, doc) and the cargo-auditable package. Its own
+        # devShell is not used: it does not forward the .vig-os knobs yet
+        # (vig-os/devkit#1810), so the dev shell below is mkProjectShell with
+        # the same toolchain and the knobs.
+        rust = vigos.lib.mkRustProject {
+          inherit pkgs;
+          src = ./.;
+          toolchainHash = "sha256-gh/xTkxKHL4eiRXzWv8KP7vfjSk61Iq48x47BEDFgfk=";
+          # include_str!'d by src/event.rs; not a cargo source file.
+          extraSrcFiles = [ "event.schema.json" ];
+          # tests/tty.rs reads the terminal's foreground group with `ps`.
+          nativeBuildInputs = [ pkgs.procps ];
         };
 
         # Devkit knobs read from .vig-os (#1224, #1432, #1431, #1282, #1633): the
@@ -160,6 +135,15 @@
           {
             inherit pkgs;
             extraPackages = extraPackages pkgs;
+            # The rust capability module, fed the same toolchain the checks
+            # build with (what mkRustProject's own devShell would wire).
+            modules = [
+              {
+                name = "rust";
+                checks = "mkRustProject";
+                inherit (rust) toolchain;
+              }
+            ];
 
             # Host-runner hooks (#1167): direnv CI runs on the bare host
             # runner, so let the flake GENERATE .pre-commit-config.yaml from
@@ -238,14 +222,15 @@
           }
         );
 
-        packages = {
-          inherit watcher-s1;
-          default = watcher-s1;
+        inherit (rust) checks;
+        packages = rust.packages // {
+          watcher-s1 = rust.packages.default;
         };
 
         apps.default = {
           type = "app";
-          program = "${watcher-s1}/bin/watcher-s1";
+          program = "${rust.packages.default}/bin/watcher-s1";
+          meta.description = "Truthful command wrapper that detects stalls, prompts and masked failures";
         };
 
         # Opt-in local dev services (#795): a daemonless process-compose stack
