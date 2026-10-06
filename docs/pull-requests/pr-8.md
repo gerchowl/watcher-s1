@@ -1,25 +1,27 @@
-# Changelog
+---
+type: pull_request
+state: open
+branch: release/0.1.0 → main
+created: 2026-10-06T10:30:53Z
+updated: 2026-10-06T15:21:25Z
+author: watcher-s1-release[bot]
+author_url: https://github.com/watcher-s1-release[bot]
+url: https://github.com/gerchowl/watcher-s1/pull/8
+comments: 0
+labels: none
+assignees: none
+milestone: none
+projects: none
+synced: 2026-10-06T15:23:31.750Z
+---
 
-All notable changes to this project will be documented in this file.
+# [PR 8](https://github.com/gerchowl/watcher-s1/pull/8) chore: release 0.1.0
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+# Release 0.1.0
 
-## Unreleased
+This PR prepares release 0.1.0 for merge to main.
 
-### Added
-
-### Changed
-
-### Deprecated
-
-### Removed
-
-### Fixed
-
-### Security
-
-## [v0.1.0](https://github.com/gerchowl/watcher-s1/releases/tag/v0.1.0) - 2026-10-06
+## [0.1.0] - TBD
 
 ### Added
 
@@ -41,3 +43,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The final group SIGKILL after a timeout or prompt cancel is sent before reaping, so it cannot hit a reused pid ([#3](https://github.com/gerchowl/watcher-s1/pull/3))
 - Interactive runs: stdin is read only when ready, output keeps CR/LF on the terminal, an inherited `SIG_IGN` (nohup) is respected ([#1](https://github.com/gerchowl/watcher-s1/pull/1))
+
