@@ -144,7 +144,7 @@ DEVKIT_COMMIT_APP_ENVIRONMENT=
 # DEVKIT_SYNC_TARGET mirror's only fold-back to the trunk (#1758). Governs
 # scaffold SHAPE only, not the flake — an unknown name aborts the scaffold
 # loudly (#1284).
-DEVKIT_FEATURES_DISABLED=sync-issues,skills,worktree,gh-templates
+DEVKIT_FEATURES_DISABLED=skills,worktree,gh-templates
 
 # License the scaffold ships: apache-2.0 (default) | proprietary | none. Empty
 # (= unset) resolves to `apache-2.0` — the shipped Apache-2.0 template, adding
