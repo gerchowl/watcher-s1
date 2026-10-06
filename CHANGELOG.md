@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `watcher-s1 judge --posttooluse`, a Claude Code PostToolUse hook for masked pipes ([#2](https://github.com/gerchowl/watcher-s1/pull/2))
 - `--on-prompt cancel`, `--log FILE` passive mode, `https://` endpoints ([#3](https://github.com/gerchowl/watcher-s1/pull/3))
 - System One question set measured on 1,474 real labelled commands: ten questions combined into one logistic score (AUC 0.95 vs 0.88), thresholds per surface (wrapper 0.5, PostToolUse judge 0.8); eval harness in `eval/`, report in `docs/eval/questions-spike.md` ([#6](https://github.com/gerchowl/watcher-s1/pull/6))
-- Release binaries (static musl Linux x86_64/aarch64, Apple-silicon macOS) and crates.io publishing through the devkit release train ([#5](https://github.com/gerchowl/watcher-s1/pull/5))
+- Release binaries (static musl Linux x86_64/aarch64, Apple-silicon macOS) attached to GitHub Releases through the devkit release train ([#5](https://github.com/gerchowl/watcher-s1/pull/5))
 
 ### Changed
 
