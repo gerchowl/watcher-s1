@@ -41,4 +41,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The final group SIGKILL after a timeout or prompt cancel is sent before reaping, so it cannot hit a reused pid ([#3](https://github.com/gerchowl/watcher-s1/pull/3))
 - Interactive runs: stdin is read only when ready, output keeps CR/LF on the terminal, an inherited `SIG_IGN` (nohup) is respected ([#1](https://github.com/gerchowl/watcher-s1/pull/1))
-
