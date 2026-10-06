@@ -91,42 +91,24 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   publish:
-    name: Publish to crates.io
+    name: Publish Extension Hook (Default No-op)
     needs: resolve
-    # Final releases only; candidates never reach crates.io.
-    if: needs.resolve.outputs.prerelease != 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    runs-on: ubuntu-26.04
+    # Gate the irreversible step behind an environment with a required
+    # reviewer (one per registry, e.g. `crates-io`, `pypi`):
+    # environment: crates-io
     permissions:
       contents: read
+      # id-token: write   # Trusted Publishing (crates.io / PyPI) via OIDC
     steps:
-      - name: Checkout the released tag
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          ref: ${{ needs.resolve.outputs.tag }}
-          persist-credentials: false
-
-      # crates.io versions are permanent: this job only runs after promote
-      # published the Release (one human approval earlier in the train). It
-      # skips, with a notice, until the CARGO_REGISTRY_TOKEN secret exists.
-      - name: Publish
+      - name: Default publish summary
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           TAG: ${{ needs.resolve.outputs.tag }}
+          PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
         run: |
-          set -euo pipefail
-          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
-            echo "::notice::CARGO_REGISTRY_TOKEN is not set: skipping the crates.io publish of $TAG"
-            exit 0
-          fi
-          version="${TAG#v}"
-          if [ "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')" != "$version" ]; then
-            echo "::error::Cargo.toml version does not match tag $TAG"
-            exit 1
-          fi
-          if curl -fsS -A "watcher-s1-release (github.com/gerchowl/watcher-s1)" \
-              "https://crates.io/api/v1/crates/watcher-s1/$version" >/dev/null 2>&1; then
-            echo "watcher-s1 $version is already on crates.io: nothing to do."
-            exit 0
-          fi
-          cargo publish --locked
+          echo "No publish extension configured."
+          echo "Tag: $TAG"
+          echo "Pre-release: $PRERELEASE"
+          echo "Replace this job to publish the released artefacts (e.g. crates.io"
+          echo "via rust-lang/crates-io-auth-action, PyPI via"
+          echo "pypa/gh-action-pypi-publish). Check out 'refs/tags/$TAG'."
