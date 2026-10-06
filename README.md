@@ -335,7 +335,11 @@ gh workflow run promote-release.yml --ref release/X.Y.Z -f version=X.Y.Z
 `promote-release.yml` publishes it and merges the release branch back to
 `main`. Publishing fires `publish-release-extension.yml`, which stays
 devkit's no-op: the crate is not published to crates.io. The train needs the
-`COMMIT_APP_*` and `RELEASE_APP_*` GitHub App secrets.
+`COMMIT_APP_*` and `RELEASE_APP_*` GitHub App secrets, from the
+`watcher-s1-commit` and `watcher-s1-release` Apps. `*_CLIENT_ID` holds the
+numeric App id, which GitHub accepts as the token issuer in place of the
+client ID. `sync-issues` stays enabled because devkit's release finalize
+dispatches it (vig-os/devkit#1843).
 
 ## License
 
