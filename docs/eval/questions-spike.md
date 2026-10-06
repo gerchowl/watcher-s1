@@ -81,6 +81,16 @@ what a flag is worth. The precision to expect at a given failure base rate:
 | wrapper, 0.5 (4 KB view) | 0.81 | 4.0 % | 0.51 | 0.69 | 0.93 |
 | judge, 0.8 (20-line view) | 0.71 | 2.2 % | 0.63 | 0.78 | 0.95 |
 
+Both rows are each view's own test split (732 commands), scored with the
+weights fitted on the 4 KB view's dev split. That the judge row equals the
+4 KB view's 0.8 numbers above is a measured coincidence, not a copy;
+`python3 eval/score.py` → `deployment_report` printed:
+
+```text
+wrap4k test n=732 @0.5: precision 0.93 recall 0.81 FPR 0.040 AUC 0.951
+tail20 test n=732 @0.8: precision 0.95 recall 0.71 FPR 0.022 AUC 0.950
+```
+
 - **Wrapper at 0.5.** It judges rare events (a run's exit, a silence
   threshold), its output goes to a gateway or human, and missing a failure
   is the costlier error.
