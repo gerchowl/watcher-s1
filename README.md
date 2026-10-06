@@ -79,7 +79,7 @@ Without Nix:
   `watcher-s1-<tag>-<target>.tar.gz` plus `.sha256`, for
   `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` (fully static,
   any distribution) and `aarch64-apple-darwin`.
-- **crates.io:** `cargo install watcher-s1`.
+- **From source:** `cargo install --git https://github.com/gerchowl/watcher-s1 --tag v0.1.0`.
 - **Ad hoc:** `nix run github:gerchowl/watcher-s1 -- -- make test`.
 
 ## Usage
@@ -333,10 +333,9 @@ gh workflow run promote-release.yml --ref release/X.Y.Z -f version=X.Y.Z
 `release.yml` tags the release and creates a **draft** GitHub Release.
 `release-binaries.yml` builds the binaries into that draft, and
 `promote-release.yml` publishes it and merges the release branch back to
-`main`. Publishing fires `publish-release-extension.yml`, which runs
-`cargo publish` to crates.io. That step is a no-op until the
-`CARGO_REGISTRY_TOKEN` secret exists. The train needs the `COMMIT_APP_*` and
-`RELEASE_APP_*` GitHub App secrets.
+`main`. Publishing fires `publish-release-extension.yml`, which stays
+devkit's no-op: the crate is not published to crates.io. The train needs the
+`COMMIT_APP_*` and `RELEASE_APP_*` GitHub App secrets.
 
 ## License
 
