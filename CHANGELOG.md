@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Event delivery no longer runs on the supervisor loop: a writer thread with a bounded queue keeps `--timeout`, signal forwarding and heartbeats responsive when the event sink (`--events-fd` pipe, stderr) is not read; heartbeats are shed under overload and report `heartbeats_dropped`, other events keep order via a bounded overflow queue. The final event may still block at exit on a sink nobody reads.
+- `--heartbeat-s1` keeps at most one System One request in flight: after an overdue verdict, later heartbeats go out with `s1: null` and no new request starts until the slow one returns.
+- Heartbeat `last_line` is the true last non-empty output line (200 chars, ANSI stripped), tracked incrementally instead of read back from the 16 KiB evidence ring.
+
 ### Security
 
 ## [v0.1.0](https://github.com/gerchowl/watcher-s1/releases/tag/v0.1.0) - 2026-10-06

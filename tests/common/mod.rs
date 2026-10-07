@@ -31,13 +31,18 @@ impl Env {
     /// A command for the binary with no ambient System One config, a
     /// private breaker state dir, and events going to `events.jsonl`.
     pub fn cmd(&self) -> Command {
+        let mut c = self.cmd_bare();
+        c.arg("--events").arg(self.path("events.jsonl"));
+        c
+    }
+
+    /// [`Env::cmd`] without an event destination (for `--events-fd` tests).
+    pub fn cmd_bare(&self) -> Command {
         let mut c = Command::new(BIN);
         c.env_remove("SYSTEMONE_URL")
             .env_remove("WATCHER_S1_PARENT")
             .env("XDG_CONFIG_HOME", self.path("xdg"))
             .env("WATCHER_S1_STATE_DIR", self.path("state"))
-            .arg("--events")
-            .arg(self.path("events.jsonl"))
             .stdin(Stdio::null());
         c
     }

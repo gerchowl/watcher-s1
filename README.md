@@ -22,7 +22,7 @@ Design and measurements: [g-fleet#244](https://github.com/gerchowl/g-fleet/issue
 |---|---|---|
 | 0 | output-silence timer, hard `--timeout` (TERM then KILL the whole process group), process-state sampler (Linux `D` state + `wchan`, darwin `U` state) | continuously, cheap |
 | 1 | regex on the unterminated last line for prompts (`password:`, `[y/N]`, `(yes/no)`, host-key questions, "Press … key", …); a weak error-line panel | when the output goes quiet |
-| 2 | a [System One](#system-one) judgement of the last 4 KB (ten questions, one logistic score) | **only at event time**: once at exit (any exit that produced output), and at the silence threshold. Never on a poll. |
+| 2 | a [System One](#system-one) judgement of the last 4 KB (ten questions, one logistic score) | **only at event time**: once at exit (any exit that produced output), and at the silence threshold. Never on a poll, with one opt-in exception: `--heartbeat-s1` asks once per heartbeat (subject to the in-flight guard and the breaker, see [Heartbeats](#heartbeats)). |
 
 **It is not** an alerting system. It owns no policy: no Telegram, no quiet
 hours, no dedupe windows. It emits events with a `severity` and a stable
@@ -59,6 +59,15 @@ only wraps (`watcher-s1 -- cmd`) or passively follows a log file
   running. Like any process, watcher-s1 still finishes its last write before
   it exits, so it waits for a reader that comes back. At exit it drains what
   the child left in the pipes (at most 3 s if a grandchild keeps writing).
+- **A stalled event reader never stalls the watch.** Events leave through a
+  writer thread and a bounded queue (256), so a full `--events-fd` pipe or
+  stderr cannot freeze `--timeout`, signal forwarding or heartbeats. When the
+  queue is full: heartbeats are dropped (the next one that gets through
+  carries `heartbeats_dropped`), other events wait in a bounded overflow
+  queue (1024, oldest dropped with a stderr diagnostic unless `-q`), and event
+  order is kept. The final event is written after everything queued; like any
+  process writing to a full pipe, watcher-s1 may block at exit on an event
+  sink nobody reads.
 - **Fail open.** If System One is not configured, down or slow, the event
   carries `"s1": null` and everything else works.
 
@@ -103,7 +112,7 @@ watcher-s1 judge --posttooluse [--s1-url URL] ...   # Claude Code hook, see belo
 | `--on-prompt wait\|cancel` | `wait` | `cancel`: an unanswered prompt gets SIGINT after `--prompt-cancel-after`, then TERM and KILL with `--kill-grace` between (final event `reason: prompt_cancelled`) |
 | `--prompt-cancel-after DUR` | `60s` | how long a prompt may wait before `cancel` acts |
 | `--heartbeat DUR` | off | emit a `heartbeat` status event every DUR (minimum `1s`), see [Heartbeats](#heartbeats) |
-| `--heartbeat-s1` | off | attach a System One verdict to each heartbeat (needs `--heartbeat`; one call per interval) |
+| `--heartbeat-s1` | off | attach a System One verdict to each heartbeat (needs `--heartbeat`; at most one request in flight, so a slow endpoint gets fewer calls than ticks, and the breaker applies) |
 | `--log FILE` | — | passive mode, see below (instead of `-- CMD`) |
 | `--evidence-bytes N` | `1500` | output tail carried in each event |
 | `--events FILE` | — | append events as JSON lines to FILE |
@@ -154,7 +163,7 @@ must ignore unknown fields).
 | `waiting_on_input` | `prompt` | warn | the last line is an unanswered prompt (adds `prompt`) |
 | `failing` | `silence` | warn | silence, and System One reads the tail as an unrecovered failure |
 | `progressing` | `resumed` | info | output resumed after a warn event |
-| *current* | `heartbeat` | info | every `--heartbeat` interval (adds `elapsed_ms`, `bytes_since_last`, `lines_since_last`, `last_line`) |
+| *current* | `heartbeat` | info | every `--heartbeat` interval (adds `elapsed_ms`, `bytes_since_last`, `lines_since_last`, `last_line`, and `heartbeats_dropped` after drops) |
 | `done` | `exit` | info | exit 0 and nothing flags it (final event) |
 | `failing` | `masked_failure` | warn | exit 0, but System One's score ≥ the wrapper threshold (final event) |
 | `failing` | `exit` / `signal` / `timeout` | error | non-zero exit, death by signal, or killed by `--timeout` (final event) |
@@ -173,13 +182,19 @@ stderr, interleaved with the child's output under `--pipe`.
 
 - `state` is the current episode state (`stalled` or `waiting_on_input` while
   one is open, otherwise `progressing`); `severity` is always `info`, since the
-  edge event already alerted.
+  edge event already alerted. Because a heartbeat repeats the open episode's
+  state, a `progressing` heartbeat means no episode is open, not that output
+  resumed.
 - `dedup_key` is `watcher-s1:<host>:heartbeat:<hash>`: all of a job's
   heartbeats fold into one key whatever their state.
 - Extra fields: `elapsed_ms` (since start, since attach in `--log` mode),
   `bytes_since_last` and `lines_since_last` (child output since the previous
   heartbeat), `last_line` (last non-empty line, ANSI stripped, at most 200
-  characters, `null` if none), plus the usual `evidence_tail`.
+  characters, `null` if none; tracked over the whole output, not just the
+  evidence tail), plus the usual `evidence_tail`. `heartbeats_dropped` appears
+  only after heartbeats were dropped because the event sink was not keeping up:
+  it counts those since the previous delivered one. Heartbeats are
+  informational, so under a stalled sink they are shed rather than queued.
 - Ticks sit at `start + k·DUR` on the monotonic clock. If the watcher was
   blocked past several ticks it emits one heartbeat, not a burst. A heartbeat
   is our output, not the child's: it never resets `--silence` or triggers
@@ -189,7 +204,8 @@ stderr, interleaved with the child's output under `--pipe`.
   and fail-open path as the silence-time call; it is attached as `s1` and never
   changes `state`. Liveness comes first: at most one such request is in
   flight. If it is still pending when the next tick is due, that heartbeat
-  is emitted with `s1: null` and so is the new tick's, with no new request;
+  is emitted with `s1: null` and so is every later tick's, with no new
+  request until that worker returns (its late verdict is discarded) or dies;
   a worker that died fails open the same way. At exit (or on a signal in
   `--log` mode) a pending verdict is waited for at most 250 ms, then the
   heartbeat goes out with `s1: null`, so heartbeats precede the final event
@@ -205,7 +221,8 @@ would reject them.
   `watcher-s1 → g-fleet-roll → watcher-s1 → nix build` chains into one causal
   thread instead of three unrelated alerts.
 - `dedup_key` = `watcher-s1:<host>:<state>:<fnv1a64(cmd)>`, stable across runs
-  of the same command.
+  of the same command. Heartbeats use the literal segment `heartbeat` in place
+  of the state.
 
 ## System One
 
