@@ -96,6 +96,8 @@ fn main() {
         blocked_after: w.blocked_after,
         probe_timeout: w.probe_timeout,
         prompt_cancel: (w.on_prompt == OnPrompt::Cancel).then_some(w.prompt_cancel_after),
+        heartbeat: w.heartbeat,
+        heartbeat_s1: w.heartbeat_s1,
         evidence_bytes: w.evidence_bytes,
         sink,
         quiet: w.quiet,

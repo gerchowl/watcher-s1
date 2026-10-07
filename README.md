@@ -102,6 +102,8 @@ watcher-s1 judge --posttooluse [--s1-url URL] ...   # Claude Code hook, see belo
 | `--probe-timeout DUR` | `2s` | wall-clock limit for one process-state probe |
 | `--on-prompt wait\|cancel` | `wait` | `cancel`: an unanswered prompt gets SIGINT after `--prompt-cancel-after`, then TERM and KILL with `--kill-grace` between (final event `reason: prompt_cancelled`) |
 | `--prompt-cancel-after DUR` | `60s` | how long a prompt may wait before `cancel` acts |
+| `--heartbeat DUR` | off | emit a `heartbeat` status event every DUR (minimum `1s`), see [Heartbeats](#heartbeats) |
+| `--heartbeat-s1` | off | attach a System One verdict to each heartbeat (needs `--heartbeat`; one call per interval) |
 | `--log FILE` | — | passive mode, see below (instead of `-- CMD`) |
 | `--evidence-bytes N` | `1500` | output tail carried in each event |
 | `--events FILE` | — | append events as JSON lines to FILE |
@@ -152,12 +154,45 @@ must ignore unknown fields).
 | `waiting_on_input` | `prompt` | warn | the last line is an unanswered prompt (adds `prompt`) |
 | `failing` | `silence` | warn | silence, and System One reads the tail as an unrecovered failure |
 | `progressing` | `resumed` | info | output resumed after a warn event |
+| *current* | `heartbeat` | info | every `--heartbeat` interval (adds `elapsed_ms`, `bytes_since_last`, `lines_since_last`, `last_line`) |
 | `done` | `exit` | info | exit 0 and nothing flags it (final event) |
 | `failing` | `masked_failure` | warn | exit 0, but System One's score ≥ the wrapper threshold (final event) |
 | `failing` | `exit` / `signal` / `timeout` | error | non-zero exit, death by signal, or killed by `--timeout` (final event) |
 | `failing` | `prompt_cancelled` | error | `--on-prompt cancel` cancelled an unanswered prompt (final event) |
 
 Every run ends with exactly one final event (`exit` non-null).
+
+### Heartbeats
+
+Events are edge-triggered, so a healthy job that runs for an hour emits
+nothing until it ends. `--heartbeat DUR` (default off, minimum `1s`) adds a
+periodic `reason: heartbeat` event so a reader can tell "running fine" from
+"the watcher died". Pair it with `--events FILE`: heartbeats go to the same
+sink as every other event, so with no `--events`/`--events-fd` they land on
+stderr, interleaved with the child's output under `--pipe`.
+
+- `state` is the current episode state (`stalled` or `waiting_on_input` while
+  one is open, otherwise `progressing`); `severity` is always `info`, since the
+  edge event already alerted.
+- `dedup_key` is `watcher-s1:<host>:heartbeat:<hash>`: all of a job's
+  heartbeats fold into one key whatever their state.
+- Extra fields: `elapsed_ms` (since start, since attach in `--log` mode),
+  `bytes_since_last` and `lines_since_last` (child output since the previous
+  heartbeat), `last_line` (last non-empty line, ANSI stripped, at most 200
+  characters, `null` if none), plus the usual `evidence_tail`.
+- Ticks sit at `start + k·DUR` on the monotonic clock. If the watcher was
+  blocked past several ticks it emits one heartbeat, not a burst. A heartbeat
+  is our output, not the child's: it never resets `--silence` or triggers
+  `resumed`.
+- No System One call by default (tier 2 is event-time only). `--heartbeat-s1`
+  makes each heartbeat ask for a verdict, through the same breaker, deadline
+  and fail-open path as the silence-time call; it is attached as `s1` and never
+  changes `state`.
+- `--log` mode emits heartbeats too.
+
+Heartbeats add `heartbeat` to the `reason` enum within schema 1. They appear
+only when you opt in, but a consumer validating strictly against the old enum
+would reject them.
 
 - `run_id` = `<host>:<watcher pid>:<start ms>`. It is exported to the child as
   `WATCHER_S1_PARENT`, and a nested watcher reports it as `caused_by`, so

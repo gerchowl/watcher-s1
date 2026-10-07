@@ -82,7 +82,23 @@ pub struct Event {
     pub proc: Option<ProcInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// Heartbeat-only fields, flattened into the event.
+    #[serde(flatten)]
+    pub heartbeat: Option<Heartbeat>,
 }
+
+/// What a `heartbeat` event adds: progress since the previous one.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Heartbeat {
+    /// Since start (since attach in `--log` mode).
+    pub elapsed_ms: u64,
+    pub bytes_since_last: u64,
+    pub lines_since_last: u64,
+    /// Last non-empty line, ANSI stripped, at most [`LAST_LINE_MAX`] chars.
+    pub last_line: Option<String>,
+}
+
+pub const LAST_LINE_MAX: usize = 200;
 
 /// Run-scoped fields every event of one watcher shares.
 #[derive(Debug, Clone)]
@@ -116,7 +132,18 @@ impl RunInfo {
             s1: None,
             proc: None,
             prompt: None,
+            heartbeat: None,
         }
+    }
+
+    /// A periodic status event: the current episode `state`, always `info`
+    /// (the edge event already alerted), and one dedup key for all of a job's
+    /// heartbeats whatever their state.
+    pub fn heartbeat(&self, state: State, evidence_tail: String, hb: Heartbeat) -> Event {
+        let mut ev = self.event(state, Severity::Info, "heartbeat", evidence_tail);
+        ev.dedup_key = dedup_key_segment(&self.host, &self.cmd, "heartbeat");
+        ev.heartbeat = Some(hb);
+        ev
     }
 }
 
@@ -127,7 +154,12 @@ pub fn dedup_key(host: &str, cmd: &str, state: State) -> String {
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))
         .unwrap_or_default();
-    format!("watcher-s1:{host}:{state}:{:016x}", fnv1a64(cmd.as_bytes()))
+    dedup_key_segment(host, cmd, &state)
+}
+
+/// [`dedup_key`] with an explicit state segment (`heartbeat`).
+pub fn dedup_key_segment(host: &str, cmd: &str, segment: &str) -> String {
+    format!("watcher-s1:{host}:{segment}:{:016x}", fnv1a64(cmd.as_bytes()))
 }
 
 fn fnv1a64(b: &[u8]) -> u64 {
@@ -328,6 +360,40 @@ mod tests {
         assert!(a.starts_with("watcher-s1:h:failing:"));
         assert_ne!(a, dedup_key("h", "cargo test", State::Stalled));
         assert_ne!(a, dedup_key("h", "cargo build", State::Failing));
+    }
+
+    #[test]
+    fn heartbeat_events_validate_and_share_one_key() {
+        let run = RunInfo {
+            host: "h".into(),
+            run_id: "h:1:1".into(),
+            cmd: "make".into(),
+            pid: 1,
+            pgid: 1,
+            caused_by: None,
+        };
+        let hb = |last_line| Heartbeat {
+            elapsed_ms: 5,
+            bytes_since_last: 1,
+            lines_since_last: 1,
+            last_line,
+        };
+        let a = run.heartbeat(State::Progressing, String::new(), hb(None));
+        let b = run.heartbeat(State::Stalled, String::new(), hb(Some("x".into())));
+        assert_eq!(a.dedup_key, b.dedup_key);
+        assert!(a.dedup_key.starts_with("watcher-s1:h:heartbeat:"));
+        assert_eq!((a.severity, a.reason.as_str()), (Severity::Info, "heartbeat"));
+        let v = validator();
+        for e in [a, b] {
+            let j = serde_json::to_value(e).unwrap();
+            assert!(v.is_valid(&j), "{j}");
+        }
+        let j = serde_json::to_value(run.heartbeat(State::Progressing, String::new(), hb(None))).unwrap();
+        assert_eq!(j["last_line"], serde_json::Value::Null);
+        assert_eq!(j["elapsed_ms"], 5);
+        // Other events carry none of the heartbeat fields.
+        let j = serde_json::to_value(run.event(State::Done, Severity::Info, "exit", String::new())).unwrap();
+        assert!(j.get("elapsed_ms").is_none());
     }
 
     #[test]

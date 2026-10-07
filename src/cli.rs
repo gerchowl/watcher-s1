@@ -28,6 +28,17 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
     Duration::try_from_secs_f64(v * mult).map_err(|_| format!("duration {s:?} is out of range"))
 }
 
+/// Shortest `--heartbeat` interval: a tighter one is noise, not a status.
+pub const MIN_HEARTBEAT: Duration = Duration::from_secs(1);
+
+fn parse_heartbeat(s: &str) -> Result<Duration, String> {
+    let d = parse_duration(s)?;
+    if d < MIN_HEARTBEAT {
+        return Err(format!("--heartbeat must be at least {MIN_HEARTBEAT:?} (got {s:?})"));
+    }
+    Ok(d)
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "watcher-s1",
@@ -125,6 +136,12 @@ pub struct WrapArgs {
     /// (silence, prompts and System One at the silence threshold; no exit).
     #[arg(long, value_name = "FILE", conflicts_with_all = ["pipe", "timeout", "on_prompt"])]
     pub log: Option<PathBuf>,
+    /// Emit a `heartbeat` status event every DUR (at least 1s; default off).
+    #[arg(long, value_name = "DUR", value_parser = parse_heartbeat)]
+    pub heartbeat: Option<Duration>,
+    /// Attach a System One verdict to each heartbeat (one call per interval).
+    #[arg(long, requires = "heartbeat")]
+    pub heartbeat_s1: bool,
     /// Bytes of output tail carried in each event.
     #[arg(long, value_name = "N", default_value_t = 1500)]
     pub evidence_bytes: usize,
@@ -181,6 +198,19 @@ mod tests {
         // A command that looks like a flag still belongs to the child.
         let c = Cli::try_parse_from(["watcher-s1", "--", "judge", "--posttooluse"]).unwrap();
         assert_eq!(c.wrap.cmd, ["judge", "--posttooluse"]);
+    }
+
+    #[test]
+    fn heartbeat_flags() {
+        let c = Cli::try_parse_from(["watcher-s1", "--heartbeat", "2s", "--", "x"]).unwrap();
+        assert_eq!(c.wrap.heartbeat, Some(Duration::from_secs(2)));
+        assert!(!c.wrap.heartbeat_s1);
+        let c = Cli::try_parse_from(["watcher-s1", "--heartbeat", "1s", "--heartbeat-s1", "--", "x"]).unwrap();
+        assert!(c.wrap.heartbeat_s1);
+        assert!(Cli::try_parse_from(["watcher-s1", "--heartbeat", "0.5s", "--", "x"]).is_err());
+        assert!(Cli::try_parse_from(["watcher-s1", "--heartbeat", "0", "--", "x"]).is_err());
+        assert!(Cli::try_parse_from(["watcher-s1", "--heartbeat-s1", "--", "x"]).is_err());
+        assert!(Cli::try_parse_from(["watcher-s1", "--heartbeat", "5s", "--log", "f"]).is_ok());
     }
 
     #[test]
