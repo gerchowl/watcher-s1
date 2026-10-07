@@ -3,7 +3,9 @@
 //! sideband events, and report its exit truthfully.
 
 use crate::detect;
-use crate::event::{BlockedProc, ENV_PARENT, Event, Exit, ProcInfo, RunInfo, Severity, Sink, State};
+use crate::event::{
+    BlockedProc, ENV_PARENT, Event, Exit, Heartbeat, LAST_LINE_MAX, ProcInfo, RunInfo, Severity, Sink, State,
+};
 use crate::probe::{Prober, Sample, sample_tree};
 use crate::questions::Surface;
 use crate::ring::{self, Ring};
@@ -38,6 +40,10 @@ pub struct Options {
     /// Cancel an unanswered prompt after this long (SIGINT, then TERM and
     /// KILL with `kill_grace` between); `None` = only report it.
     pub prompt_cancel: Option<Duration>,
+    /// Emit a `heartbeat` status event every this long (monotonic ticks).
+    pub heartbeat: Option<Duration>,
+    /// Attach a System One verdict to each heartbeat.
+    pub heartbeat_s1: bool,
     pub evidence_bytes: usize,
     pub s1: Option<Arc<Client>>,
     pub sink: Sink,
@@ -338,6 +344,14 @@ struct Watch<'a> {
     blocked_since: Option<Instant>,
     last_proc: Option<ProcInfo>,
     pending_stall: Option<(Receiver<Result<Verdict, String>>, Event)>,
+    /// Newlines seen in the child's output so far.
+    lines: u64,
+    /// Heartbeat bookkeeping: the next tick, and the counters at the last one.
+    next_heartbeat: Option<Instant>,
+    hb_bytes: u64,
+    hb_lines: u64,
+    /// Heartbeats still waiting for their System One verdict.
+    pending_heartbeats: Vec<(Receiver<Result<Verdict, String>>, Event)>,
     timeout_fired: bool,
     kill_at: Option<Instant>,
     prompt_since: Option<Instant>,
@@ -364,6 +378,11 @@ impl<'a> Watch<'a> {
             blocked_since: None,
             last_proc: None,
             pending_stall: None,
+            lines: 0,
+            next_heartbeat: opts.heartbeat.map(|d| later(now, d)),
+            hb_bytes: 0,
+            hb_lines: 0,
+            pending_heartbeats: Vec::new(),
             timeout_fired: false,
             kill_at: None,
             prompt_since: None,
@@ -390,6 +409,7 @@ impl<'a> Watch<'a> {
 
     fn on_output(&mut self, data: &[u8]) {
         self.ring.push(data);
+        self.lines += data.iter().filter(|&&b| b == b'\n').count() as u64;
         self.last_output = Instant::now();
         if self.episode_warned {
             let ev = self
@@ -406,6 +426,98 @@ impl<'a> Watch<'a> {
         self.blocked_since = None;
         self.last_sample_at = None;
         self.pending_stall = None;
+    }
+
+    /// The state a heartbeat reports: the open episode, else `progressing`.
+    fn episode_state(&self) -> State {
+        if self.prompt_emitted.is_some() {
+            State::WaitingOnInput
+        } else if self.stall_done || self.blocked_emitted {
+            State::Stalled
+        } else {
+            State::Progressing
+        }
+    }
+
+    /// Ask System One about the current tail on a worker thread, so a slow
+    /// endpoint never stalls the timers. Same breaker, deadline and fail-open
+    /// path wherever it is called from.
+    fn judge_async(&self, client: &Arc<Client>) -> Receiver<Result<Verdict, String>> {
+        let (tx, rx) = mpsc::channel();
+        let client = client.clone();
+        let cmd = self.run.cmd.clone();
+        let tail = ring::tail(&self.ring.text(), client.questions.tail_bytes).to_string();
+        let budget = s1_budget(&client);
+        std::thread::spawn(move || {
+            let _ = tx.send(client.judge(&cmd, &tail, budget));
+        });
+        rx
+    }
+
+    /// One heartbeat event: progress since the previous one. It reads the
+    /// output counters but touches neither them nor the silence timer or the
+    /// episode flags: a heartbeat is our output, not the child's.
+    fn heartbeat_event(&mut self, now: Instant) -> Event {
+        let text = self.ring.text();
+        let last_line = text
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .map(|l| l.chars().take(LAST_LINE_MAX).collect());
+        let (bytes, lines) = (self.ring.total_bytes(), self.lines);
+        let hb = Heartbeat {
+            elapsed_ms: now.duration_since(self.start).as_millis() as u64,
+            bytes_since_last: bytes - self.hb_bytes,
+            lines_since_last: lines - self.hb_lines,
+            last_line,
+        };
+        (self.hb_bytes, self.hb_lines) = (bytes, lines);
+        self.run.heartbeat(self.episode_state(), self.evidence(), hb)
+    }
+
+    /// Emit a heartbeat when its tick is due; release verdicts that arrived.
+    fn heartbeat(&mut self, now: Instant) {
+        if let (Some(every), Some(at)) = (self.opts.heartbeat, self.next_heartbeat)
+            && now >= at
+        {
+            self.next_heartbeat = Some(next_tick(self.start, every, now));
+            let ev = self.heartbeat_event(now);
+            match self.opts.s1.as_ref().filter(|_| self.opts.heartbeat_s1) {
+                Some(client) => {
+                    let rx = self.judge_async(client);
+                    self.pending_heartbeats.push((rx, ev));
+                }
+                None => self.opts.sink.emit(&ev),
+            }
+        }
+        // Oldest first, so the order of the heartbeats is kept.
+        while let Some((rx, _)) = self.pending_heartbeats.first()
+            && let Ok(res) = rx.try_recv()
+        {
+            let (_, ev) = self.pending_heartbeats.remove(0);
+            self.emit_heartbeat(ev, res);
+        }
+    }
+
+    /// Attach a verdict (or fail open without one); the state never changes.
+    fn emit_heartbeat(&self, mut ev: Event, res: Result<Verdict, String>) {
+        match res {
+            Ok(v) => ev.s1 = Some(v),
+            Err(e) => log(self.opts.quiet, &format!("System One unavailable, failing open: {e}")),
+        }
+        self.opts.sink.emit(&ev);
+    }
+
+    /// Before the final event: wait out the heartbeats still being judged
+    /// (bounded by the System One budget), so they precede it.
+    fn flush_heartbeats(&mut self) {
+        let Some(client) = &self.opts.s1 else { return };
+        let deadline = later(Instant::now(), s1_budget(client));
+        for (rx, ev) in std::mem::take(&mut self.pending_heartbeats) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let res = rx.recv_timeout(left).unwrap_or_else(|_| Err("timed out".into()));
+            self.emit_heartbeat(ev, res);
+        }
     }
 
     fn proc_info(&self, now: Instant) -> Option<ProcInfo> {
@@ -485,6 +597,8 @@ impl<'a> Watch<'a> {
             self.emit(&ev);
         }
 
+        self.heartbeat(now);
+
         // Tier 0 silence threshold, judged by System One when configured.
         if let Some(limit) = self.opts.silence
             && !self.stall_done
@@ -497,17 +611,7 @@ impl<'a> Watch<'a> {
                     .event(State::Stalled, Severity::Warn, "silence", self.evidence());
                 ev.proc = self.proc_info(now);
                 match &self.opts.s1 {
-                    Some(client) => {
-                        let (tx, rx) = mpsc::channel();
-                        let client = client.clone();
-                        let cmd = self.run.cmd.clone();
-                        let tail = ring::tail(&self.ring.text(), client.questions.tail_bytes).to_string();
-                        let budget = s1_budget(&client);
-                        std::thread::spawn(move || {
-                            let _ = tx.send(client.judge(&cmd, &tail, budget));
-                        });
-                        self.pending_stall = Some((rx, ev));
-                    }
+                    Some(client) => self.pending_stall = Some((self.judge_async(client), ev)),
                     None => self.emit(&ev),
                 }
             }
@@ -746,6 +850,13 @@ unsafe fn siginfo_pid(i: &libc::siginfo_t) -> libc::pid_t {
 #[cfg(not(target_os = "linux"))]
 unsafe fn siginfo_pid(i: &libc::siginfo_t) -> libc::pid_t {
     i.si_pid
+}
+
+/// The first heartbeat tick `start + k·every` (k >= 1) after `now`: a loop
+/// that was blocked past several ticks emits one heartbeat, not a burst.
+fn next_tick(start: Instant, every: Duration, now: Instant) -> Instant {
+    let k = now.duration_since(start).as_nanos() / every.as_nanos().max(1) + 1;
+    later(start, every.saturating_mul(u32::try_from(k).unwrap_or(u32::MAX)))
 }
 
 fn later(now: Instant, d: Duration) -> Instant {
@@ -1095,6 +1206,7 @@ pub fn run(opts: Options) -> Outcome {
             libc::tcsetpgrp(0, libc::getpgrp());
         });
     }
+    w.flush_heartbeats();
     let ev = final_event(&w, outcome);
     opts.sink.emit(&ev);
     outcome
@@ -1132,6 +1244,7 @@ pub fn run_log(opts: Options, path: &std::path::Path) -> Outcome {
         f.seek(SeekFrom::Start(start)).ok()?;
         Read::by_ref(&mut f).take(len - start).read_to_end(&mut prime).ok()?;
         w.ring.push(&prime);
+        w.hb_bytes = w.ring.total_bytes(); // what was already there is not "since last"
         Some((f, len, meta.ino()))
     };
     let mut file = open_at_end(&mut w);
@@ -1261,5 +1374,23 @@ pub fn exit_like(outcome: Outcome) -> ! {
             // Signals whose default is to ignore (or stop) land here.
             std::process::exit(128 + s)
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heartbeat_ticks_stay_on_the_grid_and_never_burst() {
+        let t0 = Instant::now();
+        let every = Duration::from_secs(2);
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        // Just after a tick: the next grid point, not "every after now".
+        assert_eq!(next_tick(t0, every, at(2) + Duration::from_millis(30)), at(4));
+        // The loop was blocked across ticks 4, 6 and 8: one heartbeat, then 10.
+        assert_eq!(next_tick(t0, every, at(8) + Duration::from_millis(500)), at(10));
+        // Exactly on a tick counts as that tick having fired.
+        assert_eq!(next_tick(t0, every, at(6)), at(8));
     }
 }
