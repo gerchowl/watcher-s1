@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-## [v0.2.0](https://github.com/gerchowl/watcher-s1/releases/tag/v0.2.0) - 2026-10-07
+## [0.2.0] - TBD
 
 ### Added
 
