@@ -64,8 +64,11 @@ only wraps (`watcher-s1 -- cmd`) or passively follows a log file
   stderr cannot freeze `--timeout`, signal forwarding or heartbeats. When the
   queue is full: heartbeats are dropped (the next one that gets through
   carries `heartbeats_dropped`), other events wait in a bounded overflow
-  queue (1024, oldest dropped with a stderr diagnostic unless `-q`), and event
-  order is kept. The final event is written after everything queued; like any
+  queue (1024, oldest dropped with a diagnostic unless `-q`), and event
+  order is kept. The watcher's own `watcher-s1 (log):` diagnostics and events
+  on the default stderr sink share one stderr writer thread behind a bounded
+  queue: a full queue drops (and counts) diagnostics instead of blocking, so a
+  stalled stderr cannot hold up `--timeout` either. The final event is written after everything queued; like any
   process writing to a full pipe, watcher-s1 may block at exit on an event
   sink nobody reads.
 - **Fail open.** If System One is not configured, down or slow, the event
@@ -81,14 +84,14 @@ inputs.watcher-s1.url = "github:gerchowl/watcher-s1";
 environment.systemPackages = [ inputs.watcher-s1.packages.${system}.default ];
 ```
 
-Pin a release with `github:gerchowl/watcher-s1?ref=v0.1.0`.
+Pin a release with `github:gerchowl/watcher-s1?ref=v0.2.0`.
 
 Without Nix:
 - **Release binaries:** every GitHub Release carries
   `watcher-s1-<tag>-<target>.tar.gz` plus `.sha256`, for
   `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` (fully static,
   any distribution) and `aarch64-apple-darwin`.
-- **From source:** `cargo install --git https://github.com/gerchowl/watcher-s1 --tag v0.1.0`.
+- **From source:** `cargo install --git https://github.com/gerchowl/watcher-s1 --tag v0.2.0`.
 - **Ad hoc:** `nix run github:gerchowl/watcher-s1 -- -- make test`.
 
 ## Usage
@@ -99,6 +102,7 @@ watcher-s1 config [--s1-url URL] [--s1-timeout SECS] [--config FILE]
 watcher-s1 judge --posttooluse [--s1-url URL] ...   # Claude Code hook, see below
 watcher-s1 follow [--new] [--timeout DUR] EVENTS_FILE  # stream events until the run ends (exit codes: `watcher-s1 guide`)
 watcher-s1 guide                                    # print the agent guide
+watcher-s1 mcp [--channel] [--state-dir DIR]        # MCP server on stdio, see "MCP server" below
 ```
 
 | Option | Default | Meaning |
@@ -170,6 +174,7 @@ must ignore unknown fields).
 | `failing` | `masked_failure` | warn | exit 0, but System One's score ≥ the wrapper threshold (final event) |
 | `failing` | `exit` / `signal` / `timeout` | error | non-zero exit, death by signal, or killed by `--timeout` (final event) |
 | `failing` | `prompt_cancelled` | error | `--on-prompt cancel` cancelled an unanswered prompt (final event) |
+| `failing` | `stopped` | error | the run was stopped through its control socket, as the MCP `watch_stop` does: TERM to the group, KILL after the grace, the job's real signal exit (final event) |
 
 Every run ends with exactly one final event (`exit` non-null).
 
@@ -312,6 +317,89 @@ watcher-s1 --silence 10m --timeout 2h --events /tmp/build.events -- nix build .#
   non-interactively) or `stalled` (silence / a `D`-state wedge).
 - Without `--events`, events land on stderr as `watcher-s1: {…}` lines, which
   the background task's output file captures alongside the command's output.
+
+### MCP server: `watcher-s1 mcp`
+
+For agents that speak MCP (Claude Code, Codex, ...), `watcher-s1 mcp` serves
+the supervisor over stdio, so an agent starts a job, goes on working, and
+asks for the verdict, with no shell juggling. It is part of the default
+build (cargo feature `mcp`; `cargo build --no-default-features` leaves it out
+and the subcommand then exits 2).
+
+Register it once:
+
+```bash
+claude mcp add watcher-s1 -- watcher-s1 mcp
+```
+
+| Tool | Does |
+|---|---|
+| `watch_start {cmd, cwd?, silence?, timeout?, heartbeat?, s1?}` | runs `cmd` (an argv array) as a fully wrapped `watcher-s1 --pipe --events ... --control ... -- cmd`, detached into its own session so it outlives the server and the session; returns the run `id` and the events and log paths. The run is recorded (`starting`) before anything is launched; if the launch fails it is marked `failed` and nothing runs |
+| `watch_wait {id, until, timeout_s?}` | blocks until the next unseen event (`until: "next"`) or the final one (`"final"`), or `timeout_s` (default 60); returns the events as JSON plus the compact `follow` lines. At most 100 events and 256 KiB per call, with `more: true` when there is more to fetch. Works for runs an earlier server started |
+| `watch_status {id}` | last event, event count, elapsed time, and `state`: `running`, `finished`, `lost` (the watcher is gone and left no final event), `starting` or `failed` |
+| `watch_stop {id, grace_s?}` | asks the run's supervisor to stop the job: TERM to its whole process group, SIGKILL to the group after `grace_s` (default 5) and again just before the leader is reaped, so a descendant that ignores TERM dies even when the leader exits at once. The final event has `reason: stopped` and the job's real signal exit |
+| `watch_list {limit?}` | runs, newest first, with state |
+
+The resource `watcher-s1://guide` is the same text as `watcher-s1 guide`.
+
+Runs live under `--state-dir` (default `$WATCHER_S1_STATE_DIR`, else
+`$XDG_STATE_HOME/watcher-s1`, else `~/.local/state/watcher-s1`), in
+`runs/<id>/`: `events.jsonl`, `output.log` (the job's output only),
+`meta.json` (command, cwd, start time, watcher pid for information, options),
+the read state (`cursor`, `summary`, `cursor.lock`) and the watcher's
+`control.sock`. The directory is the source of truth: a new server sees every
+run.
+
+**Pruning.** Runs older than 7 days whose watcher no longer answers are
+removed when a server starts and then every hour while it runs. A run whose
+watcher is still alive is never pruned, however old. Pruning is the only
+cleanup: **`output.log` is not bounded** while a job runs (nothing caps what
+the job writes), and the 7-day age rule is not a disk quota. Bound a run with
+`timeout`, and stop or prune what you no longer need.
+
+**Control and trust.** The server never signals a process id. Whether a
+watcher is alive, and stopping it, go through its private Unix socket
+(`control.sock`, mode 0600; when the run directory's path is too long for a
+socket path it lives under `$XDG_RUNTIME_DIR/watcher-s1` or
+`/tmp/watcher-s1-<uid>`). The socket is served by the hidden
+`--control PATH` flag of the wrapper; a socket nothing answers on means the
+run is not running. The run id (the directory name) is the only thing paths
+are derived from: a `meta.json` naming another id is refused, paths stored in
+it are ignored, symlinked run directories and state files and non-regular
+files are rejected, and state files are size-bounded. The state directory
+belongs to you; none of this is a defence against the user it belongs to.
+
+**Delivery.** `watch_wait` keeps a per-run cursor (a byte offset into
+`events.jsonl`), updated under a lock that is shared by overlapping calls and
+by every server process using the state directory, so two waiters never get
+the same event. The cursor moves when a response is produced. A response that
+never reaches the model (connection lost, call cancelled) loses its
+intermediate events for that caller; `events.jsonl` keeps everything, and
+`watch_status` shows the last event. The final verdict is the exception: every
+later wait repeats it with `already_seen: true`, so it is delivered at least
+once.
+
+stdout carries the protocol only; diagnostics go to stderr.
+
+#### Channels (opt-in, research preview)
+
+With `--channel` the server declares the experimental `claude/channel`
+capability and pushes one `notifications/claude/channel` message per edge
+event (`stalled`, `waiting_on_input`, `failing`, and the final event, never
+heartbeats) of the runs it started: the compact `follow` line as the content,
+`run_id` (the id the tools take), `state` and `reason` as `<channel>` tag
+attributes. Claude Code must be started with channels enabled for the server;
+while channels are a research preview, a custom server needs the development
+flag, which asks for confirmation:
+
+```bash
+claude mcp add watcher-s1 -- watcher-s1 mcp --channel
+claude --dangerously-load-development-channels server:watcher-s1
+```
+
+Team and Enterprise organisations must enable channels in their settings
+first. Without the flag the capability is simply ignored and the tools work
+as usual.
 
 ### PostToolUse hook: masked pipes
 

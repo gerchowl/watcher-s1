@@ -62,6 +62,25 @@ fn print_config(args: &S1Args) -> i32 {
     0
 }
 
+#[cfg(feature = "mcp")]
+fn run_mcp(m: watcher_s1::cli::McpArgs) -> i32 {
+    match m.state_dir.or_else(default_state_dir) {
+        Some(dir) => watcher_s1::mcp::serve(dir, m.channel),
+        None => {
+            eprintln!("watcher-s1 mcp: no state directory (set --state-dir, XDG_STATE_HOME or HOME)");
+            2
+        }
+    }
+}
+
+#[cfg(not(feature = "mcp"))]
+fn run_mcp(_: watcher_s1::cli::McpArgs) -> i32 {
+    eprintln!(
+        "watcher-s1: this build has no MCP server (built with --no-default-features); rebuild with the `mcp` feature"
+    );
+    2
+}
+
 fn main() {
     let cli = Cli::parse();
     match cli.sub {
@@ -93,6 +112,7 @@ fn main() {
                 })
             }
         },
+        Some(Sub::Mcp(m)) => std::process::exit(run_mcp(m)),
         None => {}
     }
     let w = cli.wrap;
@@ -123,6 +143,7 @@ fn main() {
         heartbeat: w.heartbeat,
         heartbeat_s1: w.heartbeat_s1,
         evidence_bytes: w.evidence_bytes,
+        control: w.control,
         sink: Arc::new(sink),
         quiet: w.quiet,
     };

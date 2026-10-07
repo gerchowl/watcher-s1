@@ -43,8 +43,10 @@ verdict.
 - `follow` locks onto the first run it sees and indents nested watchers. Once
   locked, other runs' final events cannot end it (a quiet outer watcher that
   has emitted nothing yet means the first run seen may be an inner one). It
-  copes with the file being truncated or replaced (rotated: the new file is
-  read from the start, the old one is still read for late writes). A file
+  copes with the file being truncated or replaced (rotated: the pathname is
+  checked every 500 ms, the new file is read from the start, and the old one
+  is still read for late writes; at most the 16 most recent old files are kept,
+  older ones are dropped). A line longer than 1 MiB is skipped with a warning. A file
   reused in place is only noticed when its first 64 bytes change or it
   shrinks, so use a fresh file per run.
 - `follow` reads regular files only (a FIFO is refused with exit 2). If its
@@ -59,8 +61,9 @@ verdict.
 - `--events FILE`: where events go. Without it they land on stderr.
 - `--pipe`: plain pipes instead of a PTY.
 - `--heartbeat DUR` (min `1s`, with `--events`): a periodic `heartbeat` event
-  with `elapsed_ms` and `last_line`. `--heartbeat-s1` adds a System One call per
-  tick, so costs one each.
+  with `elapsed_ms` and `last_line`. `--heartbeat-s1` opts into System One
+  verdicts on heartbeats: at most one request in flight, so a tick may skip
+  the call and carry `s1: null`.
 - `--no-s1`: skip the System One judgement (tiers 0 and 1 still run).
 - `--quiet`: no `watcher-s1 (log):` diagnostics on stderr.
 
@@ -75,6 +78,7 @@ verdict.
 | `failing` | `masked_failure` | Final. Exit 0, but the output shows a failure. Do not trust the success. |
 | `failing` | `exit`, `signal`, `timeout` | Final. Non-zero exit, killed by a signal, or killed by `--timeout`. Read the tail, fix, re-run. |
 | `failing` | `prompt_cancelled` | Final. `--on-prompt cancel` ended an unanswered prompt. Re-run non-interactively. |
+| `failing` | `stopped` | Final. The run was stopped on request (MCP `watch_stop`): TERM to the group, KILL after the grace. Nothing to fix. |
 | any | `heartbeat` | Periodic liveness, state is the current one. No action unless the state is `stalled` or `waiting_on_input`. |
 | `done` | `exit` | Final. Exit 0 and nothing flags it. |
 
@@ -92,6 +96,26 @@ so a job that ignores TERM keeps running. To force-stop, send SIGKILL to the
 job's process group, `kill -KILL -<pgid>` (`pgid` is in every event); the
 watcher then reports the signal exit truthfully. Never SIGKILL the watcher
 itself: it cannot forward anything and would orphan the job.
+
+## Over MCP
+
+If your client has the `watcher-s1` MCP server (`watcher-s1 mcp`), use its tools
+instead of the shell recipe above. `watch_start {cmd: [argv], silence?,
+timeout?, heartbeat?}` runs the job detached (it outlives the session) and
+returns an `id`. `watch_wait {id, until: "final", timeout_s}` blocks until the
+verdict (check `timed_out`, wait again if set); `until: "next"` returns events
+you have not seen. `watch_status {id}`, `watch_list` and `watch_stop {id}`
+cover the rest: stop has the supervisor send TERM to the job's whole group,
+then SIGKILL after `grace_s` (default 5) and before it reaps the leader, so
+stubborn descendants die too (final `reason: stopped`). `watch_wait` returns at
+most 100 events (`more: true` when there are more) and delivers each event once
+per run, except that the final verdict repeats with `already_seen`; a response
+lost in transit loses its events for you, so check `watch_status` and the
+`events_path` file when in doubt. `output.log` grows without bound unless you
+pass `timeout`. Events and reactions are the same as below, and a new
+session can `watch_wait` on a run an earlier one started. With `--channel`,
+edge events arrive on their own as `<channel>` messages carrying the same
+`id` as `run_id`.
 
 ## Report problems
 
