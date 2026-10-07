@@ -76,6 +76,7 @@ verdict.
 | `failing` | `masked_failure` | Final. Exit 0, but the output shows a failure. Do not trust the success. |
 | `failing` | `exit`, `signal`, `timeout` | Final. Non-zero exit, killed by a signal, or killed by `--timeout`. Read the tail, fix, re-run. |
 | `failing` | `prompt_cancelled` | Final. `--on-prompt cancel` ended an unanswered prompt. Re-run non-interactively. |
+| `failing` | `stopped` | Final. The run was stopped on request (MCP `watch_stop`): TERM to the group, KILL after the grace. Nothing to fix. |
 | any | `heartbeat` | Periodic liveness, state is the current one. No action unless the state is `stalled` or `waiting_on_input`. |
 | `done` | `exit` | Final. Exit 0 and nothing flags it. |
 

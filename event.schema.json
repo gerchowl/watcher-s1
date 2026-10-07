@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/gerchowl/watcher-s1/blob/main/event.schema.json",
   "title": "watcher-s1 event",
-  "description": "One sideband event from watcher-s1, emitted as one JSON object per line. Schema 1. Consumers must ignore unknown fields; new optional fields may be added within schema 1, and a breaking change bumps `schema`. `heartbeat` was added to the `reason` enum within schema 1: such events appear only when the caller opts in with --heartbeat, but a consumer validating strictly against the older enum would reject them.",
+  "description": "One sideband event from watcher-s1, emitted as one JSON object per line. Schema 1. Consumers must ignore unknown fields; new optional fields may be added within schema 1, and a breaking change bumps `schema`. `heartbeat` and `stopped` were added to the `reason` enum within schema 1: heartbeats appear only when the caller opts in with --heartbeat, `stopped` only when a run is stopped through the (hidden) --control socket, but a consumer validating strictly against the older enum would reject them.",
   "type": "object",
   "required": [
     "schema", "ts", "host", "source", "run_id", "cmd", "pid", "pgid", "state", "reason",
@@ -25,8 +25,8 @@
       "description": "progressing: output resumed after a stall (reason resumed), or, on a heartbeat, no stall or prompt episode is open. stalled: silence threshold or a blocked (D/U) process. waiting_on_input: an unanswered prompt. failing: non-zero exit, death by signal, timeout kill, or System One flags the output. done: exit 0 and nothing flags it."
     },
     "reason": {
-      "enum": ["exit", "signal", "timeout", "prompt_cancelled", "silence", "blocked", "prompt", "resumed", "masked_failure", "heartbeat"],
-      "description": "What triggered this event. heartbeat: a periodic status event (--heartbeat); state is then the current episode state and severity is always info."
+      "enum": ["exit", "signal", "timeout", "prompt_cancelled", "stopped", "silence", "blocked", "prompt", "resumed", "masked_failure", "heartbeat"],
+      "description": "What triggered this event. stopped: the run was stopped through its control socket (the MCP watch_stop); a final event, with the job's real signal exit. heartbeat: a periodic status event (--heartbeat); state is then the current episode state and severity is always info."
     },
     "exit": {
       "oneOf": [
