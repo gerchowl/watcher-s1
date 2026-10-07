@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.2.0] - TBD
+
+### Added
+
 - `--heartbeat DUR` (minimum `1s`) emits periodic `reason: heartbeat` status events (current episode state, severity `info`, `elapsed_ms`, `bytes_since_last`, `lines_since_last`, `last_line`) on a monotonic schedule, in `--log` mode too; `--heartbeat-s1` attaches a System One verdict to each; schema stays 1 with `heartbeat` added to the `reason` enum ([#18](https://github.com/gerchowl/watcher-s1/issues/18))
 - `watcher-s1 guide` prints an agent-sized usage guide (`docs/agent-guide.md`), and
   `watcher-s1 follow EVENTS_FILE` streams an events file as compact lines until
@@ -22,10 +36,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `watch_stop` no longer signals processes: the supervisor owns a private control socket (hidden `--control PATH`: line-delimited JSON, `status` and `stop`) and performs the stop itself, with the same TERM, grace, KILL escalation as `--timeout`, including a group SIGKILL before it reaps the leader. The new final reason `stopped` (schema 1 enum) marks it; `watch_stop` loses its `signal` option (TERM only). Liveness in `watch_status`/`watch_wait` comes from that socket, never from a pid ([#26](https://github.com/gerchowl/watcher-s1/issues/26))
 - `watch_wait` returns at most 100 events and 256 KiB per call (`more: true` when there is more), reads incrementally from a persisted byte offset, and is documented as delivering each intermediate event once per run (the final verdict repeats with `already_seen`); runs are pruned hourly while the server lives, and `output.log` is documented as unbounded unless a `timeout` is set ([#26](https://github.com/gerchowl/watcher-s1/issues/26))
-
-### Deprecated
-
-### Removed
 
 ### Fixed
 
@@ -44,8 +54,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A heartbeat still waiting for its System One verdict is released fail-open before any later event is enqueued, so events never appear out of creation order (a stale `stalled` heartbeat after `resumed`) ([#26](https://github.com/gerchowl/watcher-s1/issues/26))
 - The crate version is 0.2.0 (the binary and the MCP server reported 0.1.0), and the binary release workflow fails if `--version` differs from the tag ([#26](https://github.com/gerchowl/watcher-s1/issues/26))
 - Heartbeat `last_line` is the true last non-empty output line (200 chars, ANSI stripped), tracked incrementally instead of read back from the 16 KiB evidence ring.
-
-### Security
 
 ## [v0.1.0](https://github.com/gerchowl/watcher-s1/releases/tag/v0.1.0) - 2026-10-06
 
