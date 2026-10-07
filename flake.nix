@@ -58,7 +58,10 @@
           src = ./.;
           toolchainHash = "sha256-gh/xTkxKHL4eiRXzWv8KP7vfjSk61Iq48x47BEDFgfk=";
           # include_str!'d by src/event.rs; not a cargo source file.
-          extraSrcFiles = [ "event.schema.json" ];
+          extraSrcFiles = [
+            "event.schema.json"
+            "docs/agent-guide.md"
+          ];
           # tests/tty.rs reads the terminal's foreground group with `ps`.
           nativeBuildInputs = [ pkgs.procps ];
         };

@@ -60,6 +60,20 @@ pub enum Sub {
     Judge(JudgeArgs),
     /// Print the resolved System One configuration and where each value came from.
     Config(S1Args),
+    /// Print the agent guide: when and how to run watcher-s1 (also in docs/agent-guide.md).
+    Guide,
+    /// Follow an events file, one compact line per event, until the first run seen finishes.
+    Follow(FollowArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct FollowArgs {
+    /// The events file written by `--events` (waited for if it does not exist yet).
+    #[arg(value_name = "EVENTS_FILE")]
+    pub file: PathBuf,
+    /// Skip what the file already holds; use when a file is reused across runs.
+    #[arg(long)]
+    pub new: bool,
 }
 
 #[derive(Debug, Args)]
@@ -211,6 +225,20 @@ mod tests {
         assert!(Cli::try_parse_from(["watcher-s1", "--heartbeat", "0", "--", "x"]).is_err());
         assert!(Cli::try_parse_from(["watcher-s1", "--heartbeat-s1", "--", "x"]).is_err());
         assert!(Cli::try_parse_from(["watcher-s1", "--heartbeat", "5s", "--log", "f"]).is_ok());
+    }
+
+    #[test]
+    fn guide_and_follow_subcommands() {
+        let c = Cli::try_parse_from(["watcher-s1", "follow", "--new", "e.jsonl"]).unwrap();
+        match c.sub {
+            Some(Sub::Follow(f)) => assert!(f.new && f.file == *"e.jsonl"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            Cli::try_parse_from(["watcher-s1", "guide"]).unwrap().sub,
+            Some(Sub::Guide)
+        ));
+        assert!(Cli::try_parse_from(["watcher-s1", "follow"]).is_err());
     }
 
     #[test]

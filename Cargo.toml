@@ -10,7 +10,7 @@ readme = "README.md"
 keywords = ["supervisor", "watchdog", "pty", "claude-code", "monitoring"]
 categories = ["command-line-utilities", "development-tools"]
 # What crates.io gets: the crate and its embedded data, not CI, eval or devkit files.
-include = ["/src", "/tests", "/questions", "/event.schema.json", "/README.md", "/LICENSE", "/Cargo.toml", "/Cargo.lock"]
+include = ["/src", "/tests", "/questions", "/event.schema.json", "/docs/agent-guide.md", "/README.md", "/LICENSE", "/Cargo.toml", "/Cargo.lock"]
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }

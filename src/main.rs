@@ -4,6 +4,7 @@ use watcher_s1::breaker::{Breaker, default_state_dir};
 use watcher_s1::cli::{Cli, OnPrompt, S1Args, Sub};
 use watcher_s1::config::{self, S1Config};
 use watcher_s1::event::Sink;
+use watcher_s1::follow;
 use watcher_s1::judge;
 use watcher_s1::questions::QuestionSet;
 use watcher_s1::s1::Client;
@@ -69,6 +70,17 @@ fn main() {
             judge::run_posttooluse(client(&j.s1, true))
         }
         Some(Sub::Config(a)) => std::process::exit(print_config(&a)),
+        Some(Sub::Guide) => {
+            print!("{}", watcher_s1::GUIDE);
+            std::process::exit(0)
+        }
+        Some(Sub::Follow(f)) => match follow::run(&f.file, f.new, &mut std::io::stdout()) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("watcher-s1: follow {}: {e}", f.file.display());
+                std::process::exit(1)
+            }
+        },
         None => {}
     }
     let w = cli.wrap;
