@@ -8,9 +8,14 @@
 //! Limits, by design: only regular files are followed (a FIFO or device is
 //! refused, never opened blocking); the `--timeout` deadline is checked
 //! between events, but a write to a stdout whose reader has stopped can block
-//! until the reader resumes, and the deadline cannot fire meanwhile.
+//! until the reader resumes, and the deadline cannot fire meanwhile. A line
+//! longer than [`MAX_LINE`] is discarded through its newline (one warning),
+//! never buffered; the parent map used for indentation remembers at most
+//! [`MAX_PARENTS`] run ids; at most [`MAX_OLD_FILES`] rotated-away files are
+//! still polled for late writes (older ones are dropped, and so would be
+//! their late events).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -26,7 +31,17 @@ const TAIL_CHARS: usize = 80;
 /// Bytes read per batch; the deadline is checked between events inside it.
 const CHUNK: usize = 64 * 1024;
 /// Rotated-away files still polled for late writes by their producer.
-const MAX_OLD_FILES: usize = 16;
+pub const MAX_OLD_FILES: usize = 16;
+/// The longest line kept; a longer one is discarded through its newline.
+pub const MAX_LINE: usize = 1 << 20;
+/// Run ids whose `caused_by` is remembered (least recently seen evicted).
+pub const MAX_PARENTS: usize = 4096;
+/// How often `follow` looks at the pathname for a rotation, however busy
+/// the files it already holds are.
+const ROTATION_CHECK: Duration = Duration::from_millis(500);
+/// Bytes one `EventReader::poll` reads before it returns to let the caller
+/// yield.
+pub const POLL_BUDGET: usize = 4 * 1024 * 1024;
 
 /// The fields `follow` acts on, validated before any state changes. Unknown
 /// fields are accepted.
@@ -63,8 +78,11 @@ pub struct LineBuf {
     /// Bytes after the last newline, held until the line completes.
     partial: Vec<u8>,
     /// Drop bytes up to and including the next newline (a line we joined
-    /// mid-way).
+    /// mid-way, or one that outgrew `MAX_LINE`).
     skipping: bool,
+    /// File offset of the first byte of `partial`: the end of the last line
+    /// handled (valid when the buffer starts at a line start).
+    offset: u64,
 }
 
 impl LineBuf {
@@ -72,6 +90,7 @@ impl LineBuf {
     pub fn reset(&mut self) {
         self.partial.clear();
         self.skipping = false;
+        self.offset = 0;
     }
 
     /// Discard through the next newline before parsing anything.
@@ -96,8 +115,10 @@ pub enum Step {
 pub struct Follower {
     /// The run being followed: the first valid `run_id` seen.
     locked: Option<String>,
-    /// run_id -> caused_by, for indenting nested runs.
-    parents: HashMap<String, Option<String>>,
+    /// run_id -> (caused_by, last seen tick), for indenting nested runs;
+    /// bounded by `MAX_PARENTS`.
+    parents: HashMap<String, (Option<String>, u64)>,
+    tick: u64,
 }
 
 /// One valid event, as `Follower` hands it to a consumer.
@@ -109,6 +130,8 @@ pub struct Seen<'a> {
     pub is_final: bool,
     /// Length of the `caused_by` chain above the event's run.
     pub depth: usize,
+    /// File offset just past this event's line (its newline included).
+    pub end: u64,
 }
 
 impl Follower {
@@ -134,26 +157,57 @@ impl Follower {
     pub fn feed_with(
         &mut self,
         lb: &mut LineBuf,
-        mut chunk: &[u8],
+        chunk: &[u8],
         deadline: Option<Instant>,
         on_event: &mut dyn FnMut(Seen<'_>) -> io::Result<()>,
     ) -> io::Result<Step> {
+        let mut rest = chunk;
         if lb.skipping {
-            match chunk.iter().position(|&b| b == b'\n') {
+            match rest.iter().position(|&b| b == b'\n') {
                 Some(i) => {
-                    chunk = &chunk[i + 1..];
+                    lb.offset += i as u64 + 1;
+                    rest = &rest[i + 1..];
                     lb.skipping = false;
                 }
-                None => return Ok(Step::More),
+                None => {
+                    lb.offset += rest.len() as u64;
+                    return Ok(Step::More);
+                }
             }
         }
-        lb.partial.extend_from_slice(chunk);
-        while let Some(nl) = lb.partial.iter().position(|&b| b == b'\n') {
+        // `partial` never holds a newline, so only the new bytes are searched:
+        // a long line costs linear time, not quadratic.
+        while !rest.is_empty() {
+            let Some(nl) = rest.iter().position(|&b| b == b'\n') else {
+                if lb.partial.len() + rest.len() > MAX_LINE {
+                    eprintln!("watcher-s1 follow: discarding a line longer than {MAX_LINE} bytes");
+                    lb.offset += (lb.partial.len() + rest.len()) as u64;
+                    lb.partial.clear();
+                    lb.skipping = true;
+                } else {
+                    lb.partial.extend_from_slice(rest);
+                }
+                return Ok(Step::More);
+            };
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 return Ok(Step::Late);
             }
-            let raw: Vec<u8> = lb.partial.drain(..=nl).collect();
-            let line = String::from_utf8_lossy(&raw[..nl]);
+            let (head, tail) = (&rest[..nl], &rest[nl + 1..]);
+            rest = tail;
+            let total = lb.partial.len() + head.len();
+            lb.offset += total as u64 + 1;
+            if total > MAX_LINE {
+                eprintln!("watcher-s1 follow: discarding a line longer than {MAX_LINE} bytes");
+                lb.partial.clear();
+                continue;
+            }
+            let raw: Vec<u8> = if lb.partial.is_empty() {
+                head.to_vec()
+            } else {
+                lb.partial.extend_from_slice(head);
+                std::mem::take(&mut lb.partial)
+            };
+            let line = String::from_utf8_lossy(&raw);
             if line.trim().is_empty() {
                 continue;
             }
@@ -162,7 +216,7 @@ impl Follower {
                 .and_then(|ev| Identity::project(&ev).map(|id| (ev, id)));
             match parsed {
                 Ok((ev, id)) => {
-                    if self.event(&ev, id, on_event)? {
+                    if self.event(&ev, id, lb.offset, on_event)? {
                         return Ok(Step::Done);
                     }
                 }
@@ -179,9 +233,10 @@ impl Follower {
         &mut self,
         ev: &Value,
         id: Identity,
+        end: u64,
         on_event: &mut dyn FnMut(Seen<'_>) -> io::Result<()>,
     ) -> io::Result<bool> {
-        self.parents.entry(id.run_id.clone()).or_insert(id.caused_by);
+        self.remember(&id);
         let locked = self.locked.get_or_insert_with(|| id.run_id.clone());
         let ours = *locked == id.run_id;
         let is_final = ours && id.exit.is_some();
@@ -190,15 +245,38 @@ impl Follower {
             ours,
             is_final,
             depth: self.depth(&id.run_id),
+            end,
         })?;
         Ok(is_final)
+    }
+
+    /// Record a run's parent (first sighting wins) and keep the map bounded:
+    /// past `MAX_PARENTS` the least recently seen run, never the locked one,
+    /// is forgotten (its nested events then merely lose their indentation).
+    fn remember(&mut self, id: &Identity) {
+        self.tick += 1;
+        let tick = self.tick;
+        self.parents
+            .entry(id.run_id.clone())
+            .and_modify(|e| e.1 = tick)
+            .or_insert((id.caused_by.clone(), tick));
+        if self.parents.len() > MAX_PARENTS
+            && let Some(old) = self
+                .parents
+                .iter()
+                .filter(|(k, _)| self.locked.as_ref() != Some(*k))
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(k, _)| k.clone())
+        {
+            self.parents.remove(&old);
+        }
     }
 
     /// Length of the `caused_by` chain above `run_id` (cycle-safe).
     fn depth(&self, run_id: &str) -> usize {
         let mut depth = 0;
         let mut cur = run_id;
-        while let Some(Some(parent)) = self.parents.get(cur) {
+        while let Some((Some(parent), _)) = self.parents.get(cur) {
             depth += 1;
             if depth > self.parents.len() {
                 break;
@@ -277,9 +355,16 @@ const HEAD_LEN: usize = 64;
 /// open from waiting for a writer, and anything but a regular file is
 /// refused (`InvalidInput`).
 fn open_regular(path: &Path) -> io::Result<File> {
+    open_regular_with(path, false)
+}
+
+/// `open_regular`, optionally refusing a symlink as the final component
+/// (`O_NOFOLLOW`): for state files nobody should be able to redirect.
+pub fn open_regular_with(path: &Path, nofollow: bool) -> io::Result<File> {
+    let extra = if nofollow { libc::O_NOFOLLOW } else { 0 };
     let f = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | extra)
         .open(path)?;
     if !f.metadata()?.file_type().is_file() {
         return Err(io::Error::new(
@@ -314,6 +399,8 @@ struct Tail {
     /// the file is shorter at some poll. Use a fresh file per run.
     head: Vec<u8>,
     lines: LineBuf,
+    /// Bytes the last `poll` read.
+    last_read: usize,
 }
 
 /// Result of polling one file once.
@@ -332,7 +419,12 @@ impl Tail {
             f,
             pos,
             head: Vec::new(),
-            lines: LineBuf::default(),
+            // A nonzero start is taken to be at a line start.
+            lines: LineBuf {
+                offset: pos,
+                ..LineBuf::default()
+            },
+            last_read: 0,
         };
         if !t.sync_head()? {
             t.restart();
@@ -386,10 +478,12 @@ impl Tail {
         deadline: Option<Instant>,
         on_event: &mut dyn FnMut(Seen<'_>) -> io::Result<()>,
     ) -> io::Result<Poll> {
+        self.last_read = 0;
         if self.was_reset()? {
             self.restart();
         }
         let n = self.f.read_at(buf, self.pos)?;
+        self.last_read = n;
         if n == 0 {
             return Ok(Poll::Idle);
         }
@@ -461,6 +555,7 @@ pub fn run(path: &Path, from_end: bool, timeout: Option<Duration>, out: &mut imp
                 None => first.pos = 0,
             }
         }
+        first.lines.offset = first.pos;
         if first.sync_head()? {
             // Landed mid-line: the rest of that line is not ours.
             if landed_mid_line {
@@ -472,6 +567,7 @@ pub fn run(path: &Path, from_end: bool, timeout: Option<Duration>, out: &mut imp
     }
     eprintln!("watcher-s1 follow: watching {} (offset {})", path.display(), first.pos);
     let mut tails = vec![first];
+    let mut last_rotation_check = Instant::now();
     let mut buf = vec![0u8; CHUNK];
     let mut print = |s: Seen<'_>| {
         writeln!(out, "{}{}", "  ".repeat(s.depth), format_event(s.event))?;
@@ -490,22 +586,27 @@ pub fn run(path: &Path, from_end: bool, timeout: Option<Duration>, out: &mut imp
                 Poll::Late => return Ok(Outcome::TimedOut),
             }
         }
+        // Look at the pathname on a schedule of its own, whether or not the
+        // files we hold are busy: a producer that keeps writing to the renamed
+        // file must not hide the replacement (and the run's final event).
+        if !progressed || last_rotation_check.elapsed() >= ROTATION_CHECK {
+            last_rotation_check = Instant::now();
+            if tails.last().is_some_and(|t| t.rotated(path).unwrap_or(false)) {
+                match open_regular(path) {
+                    Ok(f) => {
+                        tails.push(Tail::open(f, 0)?);
+                        if tails.len() > MAX_OLD_FILES + 1 {
+                            tails.remove(0);
+                        }
+                        continue;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::InvalidInput => return Err(e),
+                    Err(_) => {}
+                }
+            }
+        }
         if progressed {
             continue;
-        }
-        // Everything drained: only now look for a rotation.
-        if tails.last().is_some_and(|t| t.rotated(path).unwrap_or(false)) {
-            match open_regular(path) {
-                Ok(f) => {
-                    tails.push(Tail::open(f, 0)?);
-                    if tails.len() > MAX_OLD_FILES + 1 {
-                        tails.remove(0);
-                    }
-                    continue;
-                }
-                Err(e) if e.kind() == io::ErrorKind::InvalidInput => return Err(e),
-                Err(_) => {}
-            }
         }
         sleep(POLL);
     }
@@ -520,67 +621,123 @@ pub struct Event {
     /// `format_event` of it: the compact line `follow` prints.
     pub line: String,
     pub is_final: bool,
+    /// File offset just past this event's line: resuming there skips it.
+    pub end: u64,
+}
+
+/// Where an `EventReader` stands in a file: enough to resume without
+/// rereading history. Persisted by the MCP server per run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadPos {
+    /// Byte offset of the first unprocessed line.
+    pub offset: u64,
+    /// Events of the locked run processed so far (`Event::seq` of the last).
+    pub seq: u64,
+    /// Identity of the file this refers to (a different file voids it).
+    pub dev: u64,
+    pub ino: u64,
+    /// The run the reader locked onto, once it has seen one.
+    pub locked: Option<String>,
+    /// Inside a line being discarded (it outgrew `MAX_LINE`): drop bytes up
+    /// to the next newline before parsing anything.
+    #[serde(default)]
+    pub skip: bool,
+}
+
+/// What one `EventReader::poll` produced.
+#[derive(Debug, Default)]
+pub struct Polled {
+    pub events: Vec<Event>,
+    /// The byte budget ran out before the end of the file: call again (after
+    /// yielding) for the rest.
+    pub more: bool,
 }
 
 /// Library face of `follow` for one events file, without blocking: each
-/// `poll` returns the locked run's events appended since the last one. It
-/// shares `Follower`'s validation and run locking and `Tail`'s handling of
-/// truncation and in-place reuse, but does not follow rotation (a producer
-/// that owns a fresh file per run, such as the MCP server's, never rotates).
+/// `poll` returns the locked run's events appended since the last one, at
+/// most one byte budget's worth. It shares `Follower`'s validation and run
+/// locking and `Tail`'s handling of truncation and in-place reuse, but does
+/// not follow rotation (a producer that owns a fresh file per run, such as
+/// the MCP server's, never rotates).
 pub struct EventReader {
     path: PathBuf,
+    nofollow: bool,
     tail: Option<Tail>,
     follower: Follower,
     seq: u64,
     done: bool,
     buf: Vec<u8>,
+    /// Where to start when the file is first opened.
+    resume: Option<ReadPos>,
 }
 
 impl EventReader {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         EventReader {
             path: path.into(),
+            nofollow: false,
             tail: None,
             follower: Follower::default(),
             seq: 0,
             done: false,
             buf: vec![0u8; CHUNK],
+            resume: None,
         }
     }
 
-    /// Events appended since the last call (none if the file does not exist
-    /// yet). After the final event is returned, later calls return nothing.
-    /// Errors: `InvalidInput` for a path that is not a regular file.
-    pub fn poll(&mut self) -> io::Result<Vec<Event>> {
-        let mut out = Vec::new();
+    /// Continue from `pos` in the file at `path`, which must not be a
+    /// symlink. If the file is a different one (or shorter than `pos`), the
+    /// position is void and reading starts at the top.
+    pub fn resume(path: impl Into<PathBuf>, pos: ReadPos) -> Self {
+        let mut r = EventReader::new(path);
+        r.nofollow = true;
+        r.resume = Some(pos);
+        r
+    }
+
+    /// Events appended since the last call, at most about `budget` bytes of
+    /// the file per call (none if the file does not exist yet). After the
+    /// final event is returned, later calls return nothing. Errors:
+    /// `InvalidInput` for a path that is not a regular file.
+    pub fn poll_budget(&mut self, budget: usize) -> io::Result<Polled> {
+        let mut out = Polled::default();
         if self.done {
             return Ok(out);
         }
         if self.tail.is_none() {
-            match open_regular(&self.path) {
-                Ok(f) => self.tail = Some(Tail::open(f, 0)?),
+            match open_regular_with(&self.path, self.nofollow) {
+                Ok(f) => self.tail = Some(self.start(f)?),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
                 Err(e) => return Err(e),
             }
         }
         let tail = self.tail.as_mut().expect("opened above");
         let seq = &mut self.seq;
+        let events = &mut out.events;
         let mut collect = |s: Seen<'_>| {
             if s.ours {
                 *seq += 1;
-                out.push(Event {
+                events.push(Event {
                     seq: *seq,
                     event: s.event.clone(),
                     line: format_event(s.event),
                     is_final: s.is_final,
+                    end: s.end,
                 });
             }
             Ok(())
         };
+        let mut spent = 0usize;
         loop {
             match tail.poll(&mut self.buf, &mut self.follower, None, &mut collect)? {
                 Poll::Idle => break,
-                Poll::Read => {}
+                Poll::Read => {
+                    spent += tail.last_read;
+                    if spent >= budget {
+                        out.more = true;
+                        break;
+                    }
+                }
                 Poll::Done => {
                     self.done = true;
                     break;
@@ -589,6 +746,42 @@ impl EventReader {
             }
         }
         Ok(out)
+    }
+
+    /// `poll_budget` with the default budget.
+    pub fn poll(&mut self) -> io::Result<Polled> {
+        self.poll_budget(POLL_BUDGET)
+    }
+
+    /// Open at the resume position when it still fits the file.
+    fn start(&mut self, f: File) -> io::Result<Tail> {
+        let Some(pos) = self.resume.take() else {
+            return Tail::open(f, 0);
+        };
+        let m = f.metadata()?;
+        if (m.dev(), m.ino()) != (pos.dev, pos.ino) || m.len() < pos.offset {
+            return Tail::open(f, 0);
+        }
+        self.seq = pos.seq;
+        self.follower.locked = pos.locked;
+        let mut t = Tail::open(f, pos.offset)?;
+        t.lines.skipping = pos.skip && t.pos == pos.offset;
+        Ok(t)
+    }
+
+    /// Where the reader stands: just past the last line it processed. `None`
+    /// before the file was opened.
+    pub fn position(&self) -> Option<ReadPos> {
+        let t = self.tail.as_ref()?;
+        let m = t.f.metadata().ok()?;
+        Some(ReadPos {
+            offset: t.lines.offset,
+            seq: self.seq,
+            dev: m.dev(),
+            ino: m.ino(),
+            locked: self.follower.locked.clone(),
+            skip: t.lines.skipping,
+        })
     }
 
     /// The final event has been returned.
@@ -864,23 +1057,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("e.jsonl");
         let mut r = EventReader::new(&path);
-        assert!(r.poll().unwrap().is_empty(), "a missing file is not an error");
+        assert!(r.poll().unwrap().events.is_empty(), "a missing file is not an error");
         let mut f = std::fs::File::create(&path).unwrap();
         write!(f, "{}", ev("r", None, "progressing", None)).unwrap();
-        let first = r.poll().unwrap();
+        let first = r.poll().unwrap().events;
         assert_eq!(first.len(), 1);
         assert_eq!((first[0].seq, first[0].is_final), (1, false));
         assert_eq!(first[0].line, "progressing exit info - s1=0.50 last line");
-        assert!(r.poll().unwrap().is_empty());
+        assert!(r.poll().unwrap().events.is_empty());
         // A half-written line waits for its newline; another run's events are not ours.
         let line = ev("r", None, "done", Some(0));
         let (a, b) = line.split_at(30);
         write!(f, "{}{a}", ev("other", None, "done", Some(1))).unwrap();
-        assert!(r.poll().unwrap().is_empty());
+        assert!(r.poll().unwrap().events.is_empty());
         write!(f, "{b}").unwrap();
-        let last = r.poll().unwrap();
+        let last = r.poll().unwrap().events;
         assert_eq!((last.len(), last[0].seq, last[0].is_final), (1, 2, true), "{last:?}");
-        assert!(r.is_done() && r.poll().unwrap().is_empty());
+        assert!(r.is_done() && r.poll().unwrap().events.is_empty());
     }
 
     #[test]
@@ -890,5 +1083,117 @@ mod tests {
         nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
         let e = EventReader::new(&fifo).poll().unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn an_oversized_line_is_discarded_through_its_newline_and_offsets_stay_exact() {
+        let (mut f, mut lb, mut out) = fresh();
+        // Arrives in chunks, never a newline until the end.
+        let chunk = vec![b'z'; MAX_LINE / 4 + 1];
+        for _ in 0..6 {
+            assert_eq!(feed(&mut f, &mut lb, &chunk, &mut out), Step::More);
+            assert!(lb.partial.len() <= MAX_LINE, "buffer bounded");
+        }
+        let junk = 6 * chunk.len() as u64;
+        assert!(lb.skipping && lb.partial.is_empty());
+        let good = ev("r", None, "progressing", None);
+        let rest = format!("tail of the junk line\n{good}");
+        assert_eq!(feed(&mut f, &mut lb, rest.as_bytes(), &mut out), Step::More);
+        assert_eq!(lines(&out), 1);
+        assert_eq!(
+            lb.offset,
+            junk + rest.len() as u64,
+            "offset follows every byte, discarded or not"
+        );
+        // A complete oversized line inside one chunk goes the same way.
+        let mut huge = vec![b'q'; MAX_LINE + 5];
+        huge.push(b'\n');
+        let before = lb.offset;
+        assert_eq!(feed(&mut f, &mut lb, &huge, &mut out), Step::More);
+        assert_eq!((lines(&out), lb.offset), (1, before + huge.len() as u64));
+    }
+
+    #[test]
+    fn the_parent_map_is_bounded_and_keeps_the_locked_run() {
+        let (mut f, mut lb, mut out) = fresh();
+        feed(
+            &mut f,
+            &mut lb,
+            ev("first", None, "progressing", None).as_bytes(),
+            &mut out,
+        );
+        for i in 0..(MAX_PARENTS + 500) {
+            let text = ev(&format!("run{i}"), Some("first"), "progressing", None);
+            feed(&mut f, &mut lb, text.as_bytes(), &mut out);
+        }
+        assert!(f.parents.len() <= MAX_PARENTS);
+        assert!(f.parents.contains_key("first"), "the locked run is never evicted");
+        assert!(
+            f.parents.contains_key(&format!("run{}", MAX_PARENTS + 499)),
+            "recent runs are kept"
+        );
+        assert!(!f.parents.contains_key("run0"), "the oldest went");
+    }
+
+    #[test]
+    fn event_reader_polls_in_budgeted_passes_and_resumes_from_a_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.jsonl");
+        let n = 2000;
+        std::fs::write(&path, ev("r", None, "progressing", None).repeat(n)).unwrap();
+        let mut r = EventReader::new(&path);
+        let first = r.poll_budget(CHUNK).unwrap();
+        assert!(
+            first.more && !first.events.is_empty() && first.events.len() < n,
+            "{}",
+            first.events.len()
+        );
+        let mut total = first.events.len();
+        loop {
+            let p = r.poll_budget(CHUNK).unwrap();
+            total += p.events.len();
+            if !p.more {
+                break;
+            }
+        }
+        assert_eq!(total, n);
+        // Resume at the end of the 100th event: the 101st is next, seq continues.
+        let all = EventReader::new(&path).poll_budget(usize::MAX).unwrap().events;
+        let mid = &all[99];
+        let pos = {
+            let mut probe = EventReader::new(&path);
+            probe.poll_budget(CHUNK).unwrap();
+            probe.position().unwrap()
+        };
+        let pos = ReadPos {
+            offset: mid.end,
+            seq: mid.seq,
+            ..pos
+        };
+        let got = EventReader::resume(&path, pos.clone())
+            .poll_budget(usize::MAX)
+            .unwrap()
+            .events;
+        assert_eq!((got.len(), got[0].seq), (n - 100, 101));
+        // A different file voids the position.
+        let other = dir.path().join("other.jsonl");
+        std::fs::write(&other, ev("x", None, "progressing", None).repeat(3)).unwrap();
+        let got = EventReader::resume(&other, pos).poll_budget(usize::MAX).unwrap().events;
+        assert_eq!((got.len(), got[0].seq), (3, 1));
+    }
+
+    #[test]
+    fn event_reader_refuses_a_symlink_when_resuming() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::write(&real, ev("r", None, "progressing", None)).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(EventReader::resume(&link, ReadPos::default()).poll().is_err());
+        assert_eq!(
+            EventReader::new(&link).poll().unwrap().events.len(),
+            1,
+            "follow itself still accepts a link"
+        );
     }
 }
