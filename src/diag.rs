@@ -8,7 +8,7 @@
 //!    queue is full the line is dropped and counted, and the next line that
 //!    gets through is preceded by a note with the count;
 //!  - events on the default stderr sink: they arrive from the outbox writer
-//!    thread (never the loop) via [`line`], which may block for room. Events
+//!    thread (never the loop) via [`line()`](fn@line), which may block for room. Events
 //!    are not dropped here: the outbox in front of it applies its own policy.
 //!
 //! [`drain`] waits until everything queued so far was written. It runs once,
