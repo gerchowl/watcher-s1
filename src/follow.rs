@@ -8,10 +8,11 @@
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Write};
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const POLL: Duration = Duration::from_millis(200);
 /// Characters of the evidence tail shown on a line.
@@ -22,6 +23,9 @@ const TAIL_CHARS: usize = 80;
 pub struct Follower {
     /// Bytes after the last newline, held until the line completes.
     partial: Vec<u8>,
+    /// Drop bytes up to and including the next newline (a line we joined
+    /// mid-way).
+    skipping: bool,
     /// The run being followed: the first `run_id` seen.
     locked: Option<String>,
     /// run_id -> caused_by, for indenting nested runs.
@@ -31,7 +35,16 @@ pub struct Follower {
 impl Follower {
     /// Consume a chunk, writing one line per complete event to `out`.
     /// Returns true once the locked run's final event has been printed.
-    pub fn feed(&mut self, chunk: &[u8], out: &mut impl Write) -> io::Result<bool> {
+    pub fn feed(&mut self, mut chunk: &[u8], out: &mut impl Write) -> io::Result<bool> {
+        if self.skipping {
+            match chunk.iter().position(|&b| b == b'\n') {
+                Some(i) => {
+                    chunk = &chunk[i + 1..];
+                    self.skipping = false;
+                }
+                None => return Ok(false),
+            }
+        }
         self.partial.extend_from_slice(chunk);
         while let Some(nl) = self.partial.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = self.partial.drain(..=nl).collect();
@@ -52,6 +65,18 @@ impl Follower {
             }
         }
         Ok(false)
+    }
+
+    /// The file restarted: a half-read line from the old content is void.
+    pub fn reset_partial(&mut self) {
+        self.partial.clear();
+        self.skipping = false;
+    }
+
+    /// Discard through the next newline before parsing anything.
+    pub fn skip_partial_line(&mut self) {
+        self.partial.clear();
+        self.skipping = true;
     }
 
     fn event(&mut self, ev: &Value, out: &mut impl Write) -> io::Result<bool> {
@@ -116,34 +141,144 @@ pub fn format_event(ev: &Value) -> String {
     .to_owned()
 }
 
-/// Follow `path` until the locked run's final event. With `from_end`, skip
-/// whatever the file already holds. Waits for the file to appear.
-pub fn run(path: &Path, from_end: bool, out: &mut impl Write) -> io::Result<()> {
-    let mut f = loop {
+/// How a follow ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// The locked run's final event arrived.
+    Done,
+    /// `timeout` elapsed first.
+    TimedOut,
+}
+
+/// Bytes of the file head remembered to notice a truncate-and-regrow.
+const HEAD_LEN: usize = 64;
+
+/// The open file plus what is needed to notice it was replaced or reset.
+struct Tail {
+    f: File,
+    pos: u64,
+    /// The first bytes of the file as first read. A file truncated and
+    /// regrown past `pos` between two polls keeps its inode and is longer
+    /// than `pos`, but its head differs, which this catches. Residual
+    /// limitation: a regrown file whose first `HEAD_LEN` bytes are identical
+    /// to the old ones (not the case for event lines, which carry a run_id)
+    /// goes unnoticed.
+    head: Vec<u8>,
+}
+
+impl Tail {
+    fn new(f: File, pos: u64) -> Self {
+        Tail {
+            f,
+            pos,
+            head: Vec::new(),
+        }
+    }
+
+    /// True if the file shrank or its head changed: it was reused in place.
+    fn was_reset(&mut self) -> io::Result<bool> {
+        if self.f.metadata()?.len() < self.pos {
+            return Ok(true);
+        }
+        let n = self.head.len().min(self.pos as usize);
+        if n > 0 {
+            let mut now = vec![0u8; n];
+            self.f.read_exact_at(&mut now, 0)?;
+            if now != self.head[..n] {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Read the next chunk at `pos`, remembering the file head.
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.f.read_at(buf, self.pos)?;
+        if self.pos < HEAD_LEN as u64 && n > 0 {
+            let have = self.head.len();
+            let end = (self.pos as usize + n).min(HEAD_LEN);
+            if end > have {
+                self.head
+                    .extend_from_slice(&buf[have - self.pos as usize..end - self.pos as usize]);
+            }
+        }
+        self.pos += n as u64;
+        Ok(n)
+    }
+
+    /// Did the path now name a different file than the one we hold open?
+    fn rotated(&self, path: &Path) -> io::Result<bool> {
+        match std::fs::metadata(path) {
+            Ok(m) => {
+                let mine = self.f.metadata()?;
+                Ok((m.dev(), m.ino()) != (mine.dev(), mine.ino()))
+            }
+            // Briefly absent mid-rotation: keep the old handle until it returns.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Follow `path` until the locked run's final event or `timeout`. With
+/// `from_end`, skip whatever the file already holds. Waits for the file to
+/// appear. Survives truncation, in-place reuse and rotation (the path
+/// replaced by a new file): the new file is read from its start.
+pub fn run(path: &Path, from_end: bool, timeout: Option<Duration>, out: &mut impl Write) -> io::Result<Outcome> {
+    let deadline = timeout.map(|t| Instant::now() + t);
+    let late = || deadline.is_some_and(|d| Instant::now() >= d);
+    let f = loop {
         match File::open(path) {
             Ok(f) => break f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => sleep(POLL),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if late() {
+                    return Ok(Outcome::TimedOut);
+                }
+                sleep(POLL)
+            }
             Err(e) => return Err(e),
         }
     };
-    let mut pos = if from_end { f.metadata()?.len() } else { 0 };
     let mut follower = Follower::default();
+    let mut tail = Tail::new(f, 0);
+    if from_end {
+        let len = tail.f.metadata()?.len();
+        tail.pos = len;
+        if len > 0 {
+            let mut last = [0u8; 1];
+            tail.f.read_exact_at(&mut last, len - 1)?;
+            if last[0] != b'\n' {
+                // Landed mid-line: the rest of that line is not ours.
+                follower.skip_partial_line();
+            }
+        }
+    }
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        // A file truncated for reuse starts over.
-        if f.metadata()?.len() < pos {
-            pos = 0;
+        if tail.was_reset()? {
+            tail.pos = 0;
+            tail.head.clear();
+            follower.reset_partial();
         }
-        f.seek(SeekFrom::Start(pos))?;
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            sleep(POLL);
+        let n = tail.read(&mut buf)?;
+        if n > 0 {
+            if follower.feed(&buf[..n], out)? {
+                return Ok(Outcome::Done);
+            }
             continue;
         }
-        pos += n as u64;
-        if follower.feed(&buf[..n], out)? {
-            return Ok(());
+        // Drained to EOF: only now is it safe to leave a rotated-away file.
+        if tail.rotated(path)?
+            && let Ok(f) = File::open(path)
+        {
+            tail = Tail::new(f, 0);
+            follower.reset_partial();
+            continue;
         }
+        if late() {
+            return Ok(Outcome::TimedOut);
+        }
+        sleep(POLL);
     }
 }
 
@@ -194,5 +329,26 @@ mod tests {
         assert!(!f.feed(b"not json\n", &mut out).unwrap());
         assert!(!f.feed(a.as_bytes(), &mut out).unwrap() && out.is_empty());
         assert!(f.feed(b.as_bytes(), &mut out).unwrap());
+    }
+
+    #[test]
+    fn reset_drops_the_partial_line() {
+        let mut f = Follower::default();
+        let mut out = Vec::new();
+        f.feed(b"{\"run_id\":\"old", &mut out).unwrap();
+        f.reset_partial();
+        assert!(f.feed(ev("r", None, "done", Some(0)).as_bytes(), &mut out).unwrap());
+        assert_eq!(out.iter().filter(|&&b| b == b'\n').count(), 1);
+    }
+
+    #[test]
+    fn skip_partial_line_discards_through_the_newline() {
+        let mut f = Follower::default();
+        let mut out = Vec::new();
+        f.skip_partial_line();
+        assert!(!f.feed(b"tail of a line", &mut out).unwrap());
+        let rest = format!("end\n{}", ev("r", None, "done", Some(0)));
+        assert!(f.feed(rest.as_bytes(), &mut out).unwrap());
+        assert_eq!(out.iter().filter(|&&b| b == b'\n').count(), 1);
     }
 }
