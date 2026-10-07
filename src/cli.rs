@@ -64,7 +64,12 @@ pub enum Sub {
     Guide,
     /// Follow an events file, one compact line per event, until the first run seen finishes.
     ///
-    /// Exit codes: 0 the run finished, 1 I/O error, 2 usage error, 3 --timeout elapsed first.
+    /// Exit codes: 0 the run finished, 1 I/O error, 2 usage error (including a path that is not a
+    /// regular file, such as a FIFO), 3 --timeout elapsed first.
+    ///
+    /// Limitation: output to a stdout whose reader has stopped can block, and --timeout cannot
+    /// fire meanwhile. A file reused in place is only noticed when its first 64 bytes change or
+    /// it shrinks; prefer a fresh file per run.
     Follow(FollowArgs),
 }
 

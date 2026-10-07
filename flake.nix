@@ -57,10 +57,12 @@
           inherit pkgs;
           src = ./.;
           toolchainHash = "sha256-gh/xTkxKHL4eiRXzWv8KP7vfjSk61Iq48x47BEDFgfk=";
-          # include_str!'d by src/event.rs; not a cargo source file.
+          # include_str!'d by src/event.rs, src/lib.rs and tests/drift.rs; not
+          # cargo source files.
           extraSrcFiles = [
             "event.schema.json"
             "docs/agent-guide.md"
+            "README.md"
           ];
           # tests/tty.rs reads the terminal's foreground group with `ps`.
           nativeBuildInputs = [ pkgs.procps ];
@@ -159,6 +161,16 @@
                 name = "cargo fmt --check";
                 entry = "cargo fmt --all -- --check";
                 files = "\\.rs$";
+                language = "system";
+                pass_filenames = false;
+              };
+              # The drift test reads the docs and the schema at compile time and
+              # is cheap, so run it when any of its inputs change.
+              cargo-drift-test = {
+                enable = true;
+                name = "cargo test --test drift";
+                entry = "cargo test --locked --test drift";
+                files = "^(README\\.md|docs/agent-guide\\.md|event\\.schema\\.json|src/cli\\.rs|tests/drift\\.rs)$";
                 language = "system";
                 pass_filenames = false;
               };

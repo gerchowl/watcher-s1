@@ -85,7 +85,12 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("watcher-s1: follow {}: {e}", f.file.display());
-                std::process::exit(1)
+                // A path follow cannot read at all is a usage error.
+                std::process::exit(if e.kind() == std::io::ErrorKind::InvalidInput {
+                    2
+                } else {
+                    1
+                })
             }
         },
         None => {}

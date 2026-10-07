@@ -40,9 +40,15 @@ verdict.
   runs already in it. Start it BEFORE the job: it skips everything the file
   holds, so a final event written before it opens the file is missed and it
   waits forever (use `--timeout`).
-- `follow` locks onto the first run it sees and indents nested watchers. A
-  nested watcher finishing does not end it. It copes with the file being
-  truncated or replaced (rotated) and then reads the new file from the start.
+- `follow` locks onto the first run it sees and indents nested watchers. Once
+  locked, other runs' final events cannot end it (a quiet outer watcher that
+  has emitted nothing yet means the first run seen may be an inner one). It
+  copes with the file being truncated or replaced (rotated: the new file is
+  read from the start, the old one is still read for late writes). A file
+  reused in place is only noticed when its first 64 bytes change or it
+  shrinks, so use a fresh file per run.
+- `follow` reads regular files only (a FIFO is refused with exit 2). If its
+  stdout reader stops, a write can block and `--timeout` cannot fire.
 
 ## Flags worth picking
 
@@ -73,10 +79,15 @@ field carries the last lines of output; severity is `info`, `warn` or `error`.
 
 ## Stop a run
 
-Send SIGTERM (or SIGINT) to the watcher-s1 process: it forwards the signal to
-the whole process group, then KILLs after `--kill-grace`. If the child dies of the signal, the
-final event reports `signal`; a child that traps it and exits non-zero reports
-`exit`. Do not kill only the child.
+Prefer `--timeout DUR` on the watcher: it sends TERM to the job's process
+group and KILL after `--kill-grace`, so the bound is guaranteed.
+
+To stop a run by hand, send SIGTERM (or SIGINT) to the watcher-s1 process. It
+only forwards that signal to the job's process group; there is no escalation,
+so a job that ignores TERM keeps running. To force-stop, send SIGKILL to the
+job's process group, `kill -KILL -<pgid>` (`pgid` is in every event); the
+watcher then reports the signal exit truthfully. Never SIGKILL the watcher
+itself: it cannot forward anything and would orphan the job.
 
 ## Report problems
 
