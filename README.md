@@ -97,7 +97,7 @@ Without Nix:
 watcher-s1 [OPTIONS] -- CMD [ARGS...]
 watcher-s1 config [--s1-url URL] [--s1-timeout SECS] [--config FILE]
 watcher-s1 judge --posttooluse [--s1-url URL] ...   # Claude Code hook, see below
-watcher-s1 follow [--new] EVENTS_FILE               # stream events until the run ends
+watcher-s1 follow [--new] [--timeout DUR] EVENTS_FILE  # stream events until the run ends (exit codes: `watcher-s1 guide`)
 watcher-s1 guide                                    # print the agent guide
 ```
 
