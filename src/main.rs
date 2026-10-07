@@ -74,8 +74,15 @@ fn main() {
             print!("{}", watcher_s1::GUIDE);
             std::process::exit(0)
         }
-        Some(Sub::Follow(f)) => match follow::run(&f.file, f.new, &mut std::io::stdout()) {
-            Ok(()) => std::process::exit(0),
+        Some(Sub::Follow(f)) => match follow::run(&f.file, f.new, f.timeout, &mut std::io::stdout()) {
+            Ok(follow::Outcome::Done) => std::process::exit(0),
+            Ok(follow::Outcome::TimedOut) => {
+                eprintln!(
+                    "watcher-s1: follow {}: timed out before the run's final event",
+                    f.file.display()
+                );
+                std::process::exit(3)
+            }
             Err(e) => {
                 eprintln!("watcher-s1: follow {}: {e}", f.file.display());
                 std::process::exit(1)

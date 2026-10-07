@@ -120,6 +120,135 @@ fn new_ignores_a_prior_completed_run() {
     assert!(!out.contains("old says"), "{out}");
 }
 
+fn overwrite(p: &Path, s: &str) {
+    std::fs::write(p, s).unwrap();
+}
+
+fn stderr_of(c: Child) -> (Option<i32>, String, String) {
+    let o = c.wait_with_output().unwrap();
+    (
+        o.status.code(),
+        String::from_utf8_lossy(&o.stdout).into_owned(),
+        String::from_utf8_lossy(&o.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn truncation_resets_the_partial_buffer() {
+    let e = Env::new();
+    let p = e.path("e.jsonl");
+    // A long first run, cut off mid-line, then the file is reused.
+    let old = ev("old", None, "progressing", None);
+    append(&p, &old[..old.len() - 10]);
+    let mut c = follow(&[p.to_str().unwrap()]);
+    sleep(Duration::from_millis(600));
+    assert!(c.try_wait().unwrap().is_none());
+    // Truncate in place to something shorter, then write a full run.
+    overwrite(&p, "");
+    sleep(Duration::from_millis(600));
+    append(&p, &ev("new", None, "done", Some(0)));
+    let (code, out, err) = stderr_of(c);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(out, "done exit info exit=0 - new says hi\n");
+    assert!(!err.contains("malformed"), "stale partial line leaked: {err}");
+}
+
+#[test]
+fn truncated_and_regrown_between_polls_is_noticed() {
+    let e = Env::new();
+    let p = e.path("e.jsonl");
+    append(&p, &ev("old", None, "progressing", None));
+    let mut c = follow(&[p.to_str().unwrap()]);
+    sleep(Duration::from_millis(600));
+    // Same inode, longer than before, different head.
+    // Same run (it is locked on), but a different head and longer.
+    let long = ev("old", None, "done", Some(0)).replace("old says hi", &"x".repeat(200));
+    overwrite(&p, &long);
+    let (st, out) = {
+        let st = exit_within(&mut c, 10).expect("follow did not exit");
+        (
+            st,
+            String::from_utf8_lossy(&c.wait_with_output().unwrap().stdout).into_owned(),
+        )
+    };
+    assert_eq!(st.code(), Some(0));
+    assert!(out.contains("done exit"), "{out}");
+}
+
+#[test]
+fn rotation_is_followed() {
+    let e = Env::new();
+    let p = e.path("e.jsonl");
+    let old = e.path("e.jsonl.1");
+    append(&p, &ev("r1", None, "progressing", None));
+    let c = follow(&[p.to_str().unwrap()]);
+    sleep(Duration::from_millis(600));
+    // The run's last lines land in the old file, which is then rotated away
+    // and a new file takes its place: the old tail must still be read.
+    append(&p, &ev("r1", None, "stalled", None));
+    std::fs::rename(&p, &old).unwrap();
+    sleep(Duration::from_millis(100));
+    append(&p, &ev("r1", None, "done", Some(0)));
+    let (st, out) = finish(c);
+    assert_eq!(st.code(), Some(0));
+    let states: Vec<&str> = out.lines().map(|l| l.split(' ').next().unwrap()).collect();
+    assert_eq!(states, ["progressing", "stalled", "done"], "{out}");
+}
+
+#[test]
+fn new_skips_the_rest_of_a_line_it_lands_in() {
+    let e = Env::new();
+    let p = e.path("e.jsonl");
+    let old = ev("old", None, "done", Some(0));
+    append(&p, &old[..old.len() - 15]); // writer is mid-line
+    let c = follow(&["--new", p.to_str().unwrap()]);
+    sleep(Duration::from_millis(600));
+    append(&p, &old[old.len() - 15..]);
+    append(&p, &ev("new", None, "done", Some(0)));
+    let (code, out, err) = stderr_of(c);
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(out, "done exit info exit=0 - new says hi\n");
+    assert!(!err.contains("malformed"), "{err}");
+}
+
+#[test]
+fn timeout_exits_3_with_a_note() {
+    let e = Env::new();
+    let p = e.path("e.jsonl");
+    append(&p, &ev("r", None, "progressing", None));
+    let t0 = Instant::now();
+    let c = follow(&["--timeout", "700ms", p.to_str().unwrap()]);
+    let (code, out, err) = stderr_of(c);
+    assert_eq!(code, Some(3), "{err}");
+    assert!(t0.elapsed() < Duration::from_secs(5));
+    assert!(out.starts_with("progressing"), "{out}");
+    assert_eq!(err.lines().count(), 1, "{err}");
+    assert!(err.contains("timed out"), "{err}");
+    // A file that never appears times out too.
+    let c = follow(&["--timeout", "500ms", e.path("never").to_str().unwrap()]);
+    assert_eq!(stderr_of(c).0, Some(3));
+}
+
+#[test]
+fn timeout_does_not_fire_when_the_run_finishes() {
+    let e = Env::new();
+    let p = e.path("e.jsonl");
+    append(&p, &ev("r", None, "done", Some(0)));
+    let c = follow(&["--timeout", "30s", p.to_str().unwrap()]);
+    assert_eq!(stderr_of(c).0, Some(0));
+}
+
+#[test]
+fn help_documents_exit_codes() {
+    let r = run({
+        let mut c = Command::new(BIN);
+        c.args(["follow", "--help"]);
+        c
+    });
+    let h = r.out();
+    assert!(h.contains("--timeout") && h.contains("Exit codes"), "{h}");
+}
+
 #[test]
 fn usage_errors_exit_2() {
     let r = run({

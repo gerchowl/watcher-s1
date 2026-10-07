@@ -14,21 +14,35 @@ It only reports, as JSON lines (one event per line) in a file you choose.
 
 ## Start a run
 
-Background the wrapped job with an events file, then follow the file:
+Use one fresh, unique events file per run, start the watcher in the
+background, then follow the file:
 
 ```bash
-watcher-s1 --silence 10m --timeout 2h --events /tmp/job.events -- nix build .#foo &
-watcher-s1 follow /tmp/job.events
+EV="$(mktemp -d)/job-$(date +%s)-$RANDOM.events"
+watcher-s1 --silence 10m --timeout 2h --events "$EV" -- nix build .#foo &
+watcher-s1 follow --timeout 3h "$EV"
 ```
 
-`follow` prints one line per event (`state reason severity exit s1 tail`) and
-exits 0 when the run's final event arrives. The job's own exit code is what the
-background task reports; read the final event for the verdict.
+Background the watcher with the Bash tool's `run_in_background` in Claude
+Code, or `&` in a plain shell. `follow` waits for the file to appear and reads
+it from the start, so a job that is quick or quiet cannot slip past it, and no
+earlier run can leak in. It prints one line per event (`state reason severity
+exit s1 tail`) and exits 0 when the run's final event arrives. The job's own
+exit code is what the background task reports; read the final event for the
+verdict.
 
-- Reusing an events file? Start the follow with `watcher-s1 follow --new FILE`
-  so it ignores earlier runs. Without `--new` it reads from the start.
-- `follow` waits for a file that does not exist yet, locks onto the first run
-  it sees, and indents nested watchers. A nested watcher finishing does not end it.
+- `follow --timeout DUR`: give up if the final event has not arrived in time.
+  It prints a one-line note to stderr and exits 3. Set it past the job's own
+  `--timeout`.
+- Exit codes of `follow`: 0 final event seen, 1 I/O error, 2 usage error,
+  3 `--timeout` elapsed.
+- `follow --new FILE` is only for attaching to a reused file while ignoring
+  runs already in it. Start it BEFORE the job: it skips everything the file
+  holds, so a final event written before it opens the file is missed and it
+  waits forever (use `--timeout`).
+- `follow` locks onto the first run it sees and indents nested watchers. A
+  nested watcher finishing does not end it. It copes with the file being
+  truncated or replaced (rotated) and then reads the new file from the start.
 
 ## Flags worth picking
 
@@ -60,8 +74,9 @@ field carries the last lines of output; severity is `info`, `warn` or `error`.
 ## Stop a run
 
 Send SIGTERM (or SIGINT) to the watcher-s1 process: it forwards the signal to
-the whole process group, then KILLs after `--kill-grace`. The final event
-records the signal. Do not kill only the child.
+the whole process group, then KILLs after `--kill-grace`. If the child dies of the signal, the
+final event reports `signal`; a child that traps it and exits non-zero reports
+`exit`. Do not kill only the child.
 
 ## Report problems
 

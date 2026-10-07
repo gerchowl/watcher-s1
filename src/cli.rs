@@ -63,6 +63,8 @@ pub enum Sub {
     /// Print the agent guide: when and how to run watcher-s1 (also in docs/agent-guide.md).
     Guide,
     /// Follow an events file, one compact line per event, until the first run seen finishes.
+    ///
+    /// Exit codes: 0 the run finished, 1 I/O error, 2 usage error, 3 --timeout elapsed first.
     Follow(FollowArgs),
 }
 
@@ -71,9 +73,14 @@ pub struct FollowArgs {
     /// The events file written by `--events` (waited for if it does not exist yet).
     #[arg(value_name = "EVENTS_FILE")]
     pub file: PathBuf,
-    /// Skip what the file already holds; use when a file is reused across runs.
+    /// Attach to a reused file, ignoring runs already in it.
+    ///
+    /// Start it BEFORE the job: a final event already in the file is skipped too.
     #[arg(long)]
     pub new: bool,
+    /// Give up if the run's final event has not arrived in time (exit 3).
+    #[arg(long, value_name = "DUR", value_parser = parse_duration)]
+    pub timeout: Option<Duration>,
 }
 
 #[derive(Debug, Args)]
