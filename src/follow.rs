@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -100,15 +100,43 @@ pub struct Follower {
     parents: HashMap<String, Option<String>>,
 }
 
+/// One valid event, as `Follower` hands it to a consumer.
+pub struct Seen<'a> {
+    pub event: &'a Value,
+    /// Belongs to the run this follower locked onto (the first valid `run_id`).
+    pub ours: bool,
+    /// Ours, and its `exit` is set: the run is over.
+    pub is_final: bool,
+    /// Length of the `caused_by` chain above the event's run.
+    pub depth: usize,
+}
+
 impl Follower {
-    /// Consume a chunk, writing one line per complete event to `out`. The
-    /// deadline is checked before each event.
+    /// Consume a chunk, writing one compact line per complete event to `out`.
+    /// The deadline is checked before each event.
     pub fn feed(
+        &mut self,
+        lb: &mut LineBuf,
+        chunk: &[u8],
+        deadline: Option<Instant>,
+        out: &mut impl Write,
+    ) -> io::Result<Step> {
+        self.feed_with(lb, chunk, deadline, &mut |s| {
+            writeln!(out, "{}{}", "  ".repeat(s.depth), format_event(s.event))?;
+            out.flush()
+        })
+    }
+
+    /// Consume a chunk, calling `on_event` for every complete valid event
+    /// (malformed lines are skipped with a note on stderr). Stops after the
+    /// locked run's final event (`Step::Done`) or at the deadline
+    /// (`Step::Late`); the rest of the chunk stays unread.
+    pub fn feed_with(
         &mut self,
         lb: &mut LineBuf,
         mut chunk: &[u8],
         deadline: Option<Instant>,
-        out: &mut impl Write,
+        on_event: &mut dyn FnMut(Seen<'_>) -> io::Result<()>,
     ) -> io::Result<Step> {
         if lb.skipping {
             match chunk.iter().position(|&b| b == b'\n') {
@@ -134,7 +162,7 @@ impl Follower {
                 .and_then(|ev| Identity::project(&ev).map(|id| (ev, id)));
             match parsed {
                 Ok((ev, id)) => {
-                    if self.event(&ev, id, out)? {
+                    if self.event(&ev, id, on_event)? {
                         return Ok(Step::Done);
                     }
                 }
@@ -147,13 +175,23 @@ impl Follower {
         Ok(Step::More)
     }
 
-    fn event(&mut self, ev: &Value, id: Identity, out: &mut impl Write) -> io::Result<bool> {
+    fn event(
+        &mut self,
+        ev: &Value,
+        id: Identity,
+        on_event: &mut dyn FnMut(Seen<'_>) -> io::Result<()>,
+    ) -> io::Result<bool> {
         self.parents.entry(id.run_id.clone()).or_insert(id.caused_by);
         let locked = self.locked.get_or_insert_with(|| id.run_id.clone());
         let ours = *locked == id.run_id;
-        writeln!(out, "{}{}", "  ".repeat(self.depth(&id.run_id)), format_event(ev))?;
-        out.flush()?;
-        Ok(ours && id.exit.is_some())
+        let is_final = ours && id.exit.is_some();
+        on_event(Seen {
+            event: ev,
+            ours,
+            is_final,
+            depth: self.depth(&id.run_id),
+        })?;
+        Ok(is_final)
     }
 
     /// Length of the `caused_by` chain above `run_id` (cycle-safe).
@@ -346,7 +384,7 @@ impl Tail {
         buf: &mut [u8],
         follower: &mut Follower,
         deadline: Option<Instant>,
-        out: &mut impl Write,
+        on_event: &mut dyn FnMut(Seen<'_>) -> io::Result<()>,
     ) -> io::Result<Poll> {
         if self.was_reset()? {
             self.restart();
@@ -361,11 +399,13 @@ impl Tail {
             self.restart();
             return Ok(Poll::Read);
         }
-        Ok(match follower.feed(&mut self.lines, &buf[..n], deadline, out)? {
-            Step::More => Poll::Read,
-            Step::Done => Poll::Done,
-            Step::Late => Poll::Late,
-        })
+        Ok(
+            match follower.feed_with(&mut self.lines, &buf[..n], deadline, on_event)? {
+                Step::More => Poll::Read,
+                Step::Done => Poll::Done,
+                Step::Late => Poll::Late,
+            },
+        )
     }
 
     /// Did the path now name a different file than the one we hold open?
@@ -433,13 +473,17 @@ pub fn run(path: &Path, from_end: bool, timeout: Option<Duration>, out: &mut imp
     eprintln!("watcher-s1 follow: watching {} (offset {})", path.display(), first.pos);
     let mut tails = vec![first];
     let mut buf = vec![0u8; CHUNK];
+    let mut print = |s: Seen<'_>| {
+        writeln!(out, "{}{}", "  ".repeat(s.depth), format_event(s.event))?;
+        out.flush()
+    };
     loop {
         if late() {
             return Ok(Outcome::TimedOut);
         }
         let mut progressed = false;
         for t in tails.iter_mut() {
-            match t.poll(&mut buf, &mut follower, deadline, out)? {
+            match t.poll(&mut buf, &mut follower, deadline, &mut print)? {
                 Poll::Idle => {}
                 Poll::Read => progressed = true,
                 Poll::Done => return Ok(Outcome::Done),
@@ -464,6 +508,92 @@ pub fn run(path: &Path, from_end: bool, timeout: Option<Duration>, out: &mut imp
             }
         }
         sleep(POLL);
+    }
+}
+
+/// An event the caller has not seen yet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Event {
+    /// 1-based position among the locked run's events in the file.
+    pub seq: u64,
+    pub event: Value,
+    /// `format_event` of it: the compact line `follow` prints.
+    pub line: String,
+    pub is_final: bool,
+}
+
+/// Library face of `follow` for one events file, without blocking: each
+/// `poll` returns the locked run's events appended since the last one. It
+/// shares `Follower`'s validation and run locking and `Tail`'s handling of
+/// truncation and in-place reuse, but does not follow rotation (a producer
+/// that owns a fresh file per run, such as the MCP server's, never rotates).
+pub struct EventReader {
+    path: PathBuf,
+    tail: Option<Tail>,
+    follower: Follower,
+    seq: u64,
+    done: bool,
+    buf: Vec<u8>,
+}
+
+impl EventReader {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        EventReader {
+            path: path.into(),
+            tail: None,
+            follower: Follower::default(),
+            seq: 0,
+            done: false,
+            buf: vec![0u8; CHUNK],
+        }
+    }
+
+    /// Events appended since the last call (none if the file does not exist
+    /// yet). After the final event is returned, later calls return nothing.
+    /// Errors: `InvalidInput` for a path that is not a regular file.
+    pub fn poll(&mut self) -> io::Result<Vec<Event>> {
+        let mut out = Vec::new();
+        if self.done {
+            return Ok(out);
+        }
+        if self.tail.is_none() {
+            match open_regular(&self.path) {
+                Ok(f) => self.tail = Some(Tail::open(f, 0)?),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
+                Err(e) => return Err(e),
+            }
+        }
+        let tail = self.tail.as_mut().expect("opened above");
+        let seq = &mut self.seq;
+        let mut collect = |s: Seen<'_>| {
+            if s.ours {
+                *seq += 1;
+                out.push(Event {
+                    seq: *seq,
+                    event: s.event.clone(),
+                    line: format_event(s.event),
+                    is_final: s.is_final,
+                });
+            }
+            Ok(())
+        };
+        loop {
+            match tail.poll(&mut self.buf, &mut self.follower, None, &mut collect)? {
+                Poll::Idle => break,
+                Poll::Read => {}
+                Poll::Done => {
+                    self.done = true;
+                    break;
+                }
+                Poll::Late => unreachable!("no deadline was given"),
+            }
+        }
+        Ok(out)
+    }
+
+    /// The final event has been returned.
+    pub fn is_done(&self) -> bool {
+        self.done
     }
 }
 
@@ -646,7 +776,9 @@ mod tests {
     }
 
     fn poll(t: &mut Tail, f: &mut Follower, out: &mut Vec<u8>) -> io::Result<Poll> {
-        t.poll(&mut vec![0u8; CHUNK], f, None, out)
+        t.poll(&mut vec![0u8; CHUNK], f, None, &mut |s| {
+            writeln!(out, "{}{}", "  ".repeat(s.depth), format_event(s.event))
+        })
     }
 
     #[test]
@@ -725,5 +857,38 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
         let e = open_regular(dir.path()).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+    }
+
+    #[test]
+    fn event_reader_returns_new_events_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.jsonl");
+        let mut r = EventReader::new(&path);
+        assert!(r.poll().unwrap().is_empty(), "a missing file is not an error");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(f, "{}", ev("r", None, "progressing", None)).unwrap();
+        let first = r.poll().unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!((first[0].seq, first[0].is_final), (1, false));
+        assert_eq!(first[0].line, "progressing exit info - s1=0.50 last line");
+        assert!(r.poll().unwrap().is_empty());
+        // A half-written line waits for its newline; another run's events are not ours.
+        let line = ev("r", None, "done", Some(0));
+        let (a, b) = line.split_at(30);
+        write!(f, "{}{a}", ev("other", None, "done", Some(1))).unwrap();
+        assert!(r.poll().unwrap().is_empty());
+        write!(f, "{b}").unwrap();
+        let last = r.poll().unwrap();
+        assert_eq!((last.len(), last[0].seq, last[0].is_final), (1, 2, true), "{last:?}");
+        assert!(r.is_done() && r.poll().unwrap().is_empty());
+    }
+
+    #[test]
+    fn event_reader_refuses_a_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        let e = EventReader::new(&fifo).poll().unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
     }
 }

@@ -12,6 +12,8 @@ pub mod event;
 pub mod follow;
 pub mod http;
 pub mod judge;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod outbox;
 pub mod probe;
 pub mod questions;
