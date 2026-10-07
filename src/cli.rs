@@ -31,7 +31,7 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
 /// Shortest `--heartbeat` interval: a tighter one is noise, not a status.
 pub const MIN_HEARTBEAT: Duration = Duration::from_secs(1);
 
-fn parse_heartbeat(s: &str) -> Result<Duration, String> {
+pub fn parse_heartbeat(s: &str) -> Result<Duration, String> {
     let d = parse_duration(s)?;
     if d < MIN_HEARTBEAT {
         return Err(format!("--heartbeat must be at least {MIN_HEARTBEAT:?} (got {s:?})"));
@@ -71,6 +71,27 @@ pub enum Sub {
     /// fire meanwhile. A file reused in place is only noticed when its first 64 bytes change or
     /// it shrinks; prefer a fresh file per run.
     Follow(FollowArgs),
+    /// Serve watcher-s1 as an MCP server on stdio (needs the `mcp` build feature, on by default).
+    ///
+    /// Tools: watch_start, watch_wait, watch_status, watch_stop, watch_list; resource
+    /// watcher-s1://guide. Runs live under STATE_DIR/runs/ and outlive the server. stdout carries
+    /// the protocol only; diagnostics go to stderr.
+    Mcp(McpArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct McpArgs {
+    /// Push one Claude Code channel notification per edge event (stalled, waiting_on_input,
+    /// failing, final) of the runs this server starts.
+    ///
+    /// Declares the experimental `claude/channel` capability; Claude Code must be started with
+    /// --dangerously-load-development-channels server:NAME for it to be delivered.
+    #[arg(long)]
+    pub channel: bool,
+    /// Where runs are kept (default: $WATCHER_S1_STATE_DIR, else $XDG_STATE_HOME/watcher-s1,
+    /// else ~/.local/state/watcher-s1).
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -251,6 +272,20 @@ mod tests {
             Some(Sub::Guide)
         ));
         assert!(Cli::try_parse_from(["watcher-s1", "follow"]).is_err());
+    }
+
+    #[test]
+    fn mcp_subcommand() {
+        let c = Cli::try_parse_from(["watcher-s1", "mcp", "--channel", "--state-dir", "/s"]).unwrap();
+        match c.sub {
+            Some(Sub::Mcp(m)) => assert!(m.channel && m.state_dir.as_deref() == Some(std::path::Path::new("/s"))),
+            other => panic!("{other:?}"),
+        }
+        match Cli::try_parse_from(["watcher-s1", "mcp"]).unwrap().sub {
+            Some(Sub::Mcp(m)) => assert!(!m.channel && m.state_dir.is_none()),
+            other => panic!("{other:?}"),
+        }
+        assert!(Cli::try_parse_from(["watcher-s1", "mcp", "--bogus"]).is_err());
     }
 
     #[test]
