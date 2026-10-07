@@ -9,8 +9,8 @@
 //!    dropped and counted, and the next one that gets through carries the
 //!    count as `heartbeats_dropped`;
 //!  - other events wait in a bounded overflow queue that is retried on every
-//!    loop iteration; beyond its bound the oldest is dropped (with a stderr
-//!    diagnostic unless quiet);
+//!    loop iteration; beyond its bound the oldest is dropped (with a
+//!    nonblocking diagnostic unless quiet);
 //!  - the final event is sent last, blocking, then the writer is joined: like
 //!    any process writing to a full pipe, the watcher may block at exit on a
 //!    sink nobody reads.
@@ -121,9 +121,9 @@ impl Outbox {
             self.overflow.pop_front();
             if !self.warned && !self.quiet {
                 self.warned = true;
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "watcher-s1: the event sink is not keeping up; dropping the oldest queued events"
+                crate::diag::log(
+                    false,
+                    "the event sink is not keeping up; dropping the oldest queued events",
                 );
             }
         }
@@ -149,8 +149,6 @@ impl Outbox {
         self.overflow.len()
     }
 }
-
-use std::io::Write as _;
 
 impl Drop for Outbox {
     fn drop(&mut self) {
