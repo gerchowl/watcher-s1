@@ -189,6 +189,9 @@ pub struct WrapArgs {
     /// Attach a System One verdict to each heartbeat (at most one request in flight; the breaker applies).
     #[arg(long, requires = "heartbeat")]
     pub heartbeat_s1: bool,
+    /// Internal (the MCP server uses it): serve status/stop requests on a Unix socket at PATH.
+    #[arg(long, value_name = "PATH", hide = true)]
+    pub control: Option<PathBuf>,
     /// Bytes of output tail carried in each event.
     #[arg(long, value_name = "N", default_value_t = 1500)]
     pub evidence_bytes: usize,

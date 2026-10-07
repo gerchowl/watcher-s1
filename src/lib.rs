@@ -7,6 +7,7 @@ pub const GUIDE: &str = include_str!("../docs/agent-guide.md");
 pub mod breaker;
 pub mod cli;
 pub mod config;
+pub mod control;
 pub mod detect;
 pub mod diag;
 pub mod event;
