@@ -2,6 +2,7 @@
 //! default), tee its output through unchanged, watch it (tiers 0–2), emit
 //! sideband events, and report its exit truthfully.
 
+use crate::control::{ControlServer, StatusReply};
 use crate::detect;
 use crate::event::{BlockedProc, ENV_PARENT, Event, Exit, Heartbeat, ProcInfo, RunInfo, Severity, Sink, State};
 use crate::outbox::Outbox;
@@ -44,6 +45,8 @@ pub struct Options {
     /// Attach a System One verdict to each heartbeat.
     pub heartbeat_s1: bool,
     pub evidence_bytes: usize,
+    /// Serve status and stop requests on this Unix socket (see `control`).
+    pub control: Option<std::path::PathBuf>,
     pub s1: Option<Arc<Client>>,
     pub sink: Arc<Sink>,
     pub quiet: bool,
@@ -355,6 +358,8 @@ struct Watch<'a> {
     kill_at: Option<Instant>,
     prompt_since: Option<Instant>,
     cancel_fired: bool,
+    /// A control-socket `stop` made us TERM (then KILL) the group.
+    stop_fired: bool,
     term_at: Option<Instant>,
 }
 
@@ -388,13 +393,45 @@ impl<'a> Watch<'a> {
             kill_at: None,
             prompt_since: None,
             cancel_fired: false,
+            stop_fired: false,
             term_at: None,
         }
     }
 
-    /// Did we (timeout or prompt cancel) kill the group?
+    /// Did we (timeout, prompt cancel or a control-socket stop) kill the group?
     fn we_killed(&self) -> bool {
-        self.timeout_fired || self.cancel_fired
+        self.timeout_fired || self.cancel_fired || self.stop_fired
+    }
+
+    /// The answer to a control-socket `status`.
+    fn control_status(&self, pid: Option<i32>) -> StatusReply {
+        let state = serde_json::to_value(self.episode_state())
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        StatusReply {
+            pid,
+            pgid: pid,
+            state: match state.as_str() {
+                "stalled" => "stalled",
+                "waiting_on_input" => "waiting_on_input",
+                _ => "progressing",
+            },
+            elapsed_ms: self.start.elapsed().as_millis() as u64,
+        }
+    }
+
+    /// A control-socket `stop`: the `--timeout` escalation with the caller's
+    /// grace (TERM now, KILL after it, and KILL again before the leader is
+    /// reaped), ending with `reason: stopped`. A run already being killed
+    /// keeps its own schedule.
+    fn request_stop(&mut self, now: Instant, grace: Duration) {
+        if self.we_killed() {
+            return;
+        }
+        self.stop_fired = true;
+        let _ = kill(Pid::from_raw(-self.run.pgid), Signal::SIGTERM);
+        self.kill_at = Some(later(now, grace));
     }
 
     fn evidence(&self) -> String {
@@ -960,6 +997,12 @@ pub fn run(opts: Options) -> Outcome {
             return Outcome::Code(125);
         }
     };
+    // Bound before the child exists, so a path we cannot use fails the run
+    // before anything starts.
+    let mut control = match bind_control(&opts) {
+        Ok(c) => c,
+        Err(code) => return Outcome::Code(code),
+    };
     let mut run = make_run_info(&opts.argv, 0);
     let mut sp = match spawn(&opts, &run.run_id, interactive) {
         Ok(s) => s,
@@ -1060,6 +1103,9 @@ pub fn run(opts: Options) -> Outcome {
             }
             _ => None,
         };
+        if let Some(c) = &control {
+            c.push_pollfds(&mut fds);
+        }
         unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 100) };
         // An output fd the kernel calls invalid would otherwise spin.
         for (i, (fd, _)) in sp.outputs.iter().enumerate() {
@@ -1087,6 +1133,15 @@ pub fn run(opts: Options) -> Outcome {
                     let _ = kill(Pid::from_raw(-w.run.pgid), sig);
                 }
             }
+        }
+
+        // Control socket: status is answered from here, a stop starts the
+        // timeout-style escalation (only while the child is still running).
+        if let Some(c) = control.as_mut()
+            && let Some(grace) = c.service(&|| w.control_status(Some(pid)))
+            && status.is_none()
+        {
+            w.request_stop(Instant::now(), grace);
         }
 
         // Output: into the ring, and to the writer to tee through unchanged.
@@ -1243,6 +1298,10 @@ pub fn run_log(opts: Options, path: &std::path::Path) -> Outcome {
             return Outcome::Code(125);
         }
     };
+    let mut control = match bind_control(&opts) {
+        Ok(c) => c,
+        Err(code) => return Outcome::Code(code),
+    };
     let mut run = make_run_info(&[], 0);
     run.cmd = format!("--log {}", path.display());
     run.pgid = 0;
@@ -1270,12 +1329,23 @@ pub fn run_log(opts: Options, path: &std::path::Path) -> Outcome {
     }
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        let mut p = libc::pollfd {
+        let mut fds = vec![libc::pollfd {
             fd: sig_r.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
-        };
-        unsafe { libc::poll(&mut p, 1, 200) };
+        }];
+        if let Some(c) = &control {
+            c.push_pollfds(&mut fds);
+        }
+        unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 200) };
+        // A control `stop` ends passive mode as TERM does: there is no child.
+        if let Some(c) = control.as_mut()
+            && c.service(&|| w.control_status(None)).is_some()
+        {
+            w.flush_heartbeats();
+            w.out.finish(None);
+            return Outcome::Signal(libc::SIGTERM);
+        }
         let mut sb = [0u8; 64];
         while let Some(n) = read_some(sig_r.as_raw_fd(), &mut sb).filter(|n| *n > 0) {
             if let Some(&s) = sb[..n].iter().find(|&&s| FORWARDED.contains(&(s as libc::c_int)))
@@ -1314,6 +1384,20 @@ pub fn run_log(opts: Options, path: &std::path::Path) -> Outcome {
     }
 }
 
+/// Create the `--control` socket if one was asked for; the error is the exit code.
+fn bind_control(opts: &Options) -> Result<Option<ControlServer>, i32> {
+    let Some(path) = &opts.control else { return Ok(None) };
+    ControlServer::bind(path).map(Some).map_err(|e| {
+        // Plain stderr, not `log`: the caller asked for this socket and must hear why it failed.
+        let _ = writeln!(
+            std::io::stderr(),
+            "watcher-s1 (error): cannot create the control socket {}: {e}",
+            path.display()
+        );
+        125
+    })
+}
+
 /// Read `f` to its current end, feeding the watch.
 fn drain_file(f: &mut std::fs::File, offset: &mut u64, w: &mut Watch<'_>, buf: &mut [u8]) {
     use std::io::Read;
@@ -1334,6 +1418,7 @@ fn final_event(w: &Watch<'_>, outcome: Outcome) -> Event {
     let (mut state, mut severity, reason) = match outcome {
         _ if w.timeout_fired => (State::Failing, Severity::Error, "timeout"),
         _ if w.cancel_fired => (State::Failing, Severity::Error, "prompt_cancelled"),
+        _ if w.stop_fired => (State::Failing, Severity::Error, "stopped"),
         Outcome::Code(0) => (State::Done, Severity::Info, "exit"),
         Outcome::Code(_) => (State::Failing, Severity::Error, "exit"),
         Outcome::Signal(_) => (State::Failing, Severity::Error, "signal"),
