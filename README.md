@@ -471,20 +471,28 @@ never parallelise them.
 
 ## Releasing
 
-Releases go through the [vig-os/devkit](https://github.com/vig-os/devkit)
-release train ([`docs/DOWNSTREAM_RELEASE.md`](docs/DOWNSTREAM_RELEASE.md)),
-with tags `vX.Y.Z`:
+Branches follow devkit's gitflow model: work lands on `dev` through PRs, and
+`main` only takes releases. Rulesets require a PR and a green `CI Summary` on
+`dev` and `main`, plus one approval on `main`; only the release Apps may write
+`v*` tags. Releases go through the
+[vig-os/devkit](https://github.com/vig-os/devkit) release train
+([`docs/DOWNSTREAM_RELEASE.md`](docs/DOWNSTREAM_RELEASE.md)), with tags
+`vX.Y.Z`:
 
 ```bash
-gh workflow run prepare-release.yml -f version=X.Y.Z          # cut release/X.Y.Z from main
+gh workflow run prepare-release.yml -f version=X.Y.Z          # cut release/X.Y.Z from dev
 gh workflow run release.yml --ref release/X.Y.Z -f version=X.Y.Z -f release-kind=final -f dry-run=false
 gh workflow run promote-release.yml --ref release/X.Y.Z -f version=X.Y.Z
 ```
 
-`release.yml` tags the release and creates a **draft** GitHub Release.
+Mark the release PR ready and wait for green CI before `release.yml`; approve
+it (it is opened by the Release App) right before promote. `release.yml` tags
+the release and creates a **draft** GitHub Release.
 `release-binaries.yml` builds the binaries into that draft, and
-`promote-release.yml` publishes it and merges the release branch back to
-`main`. Publishing fires `publish-release-extension.yml`, which stays
+`promote-release.yml` publishes it and merges the release PR into `main`;
+`sync-main-to-dev.yml` then opens a PR bringing `main` back into `dev`. Delete
+the merged `release/X.Y.Z` branch afterwards, or the next `prepare-release`
+refuses (vig-os/devkit#1849). Publishing fires `publish-release-extension.yml`, which stays
 devkit's no-op: the crate is not published to crates.io. The train needs the
 `COMMIT_APP_*` and `RELEASE_APP_*` GitHub App secrets, from the
 `watcher-s1-commit` and `watcher-s1-release` Apps. `*_CLIENT_ID` holds the
