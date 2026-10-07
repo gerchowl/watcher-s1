@@ -58,6 +58,9 @@ verdict.
   it (`--prompt-cancel-after DUR` sets the wait).
 - `--events FILE`: where events go. Without it they land on stderr.
 - `--pipe`: plain pipes instead of a PTY.
+- `--heartbeat DUR` (min `1s`, with `--events`): a periodic `heartbeat` event
+  with `elapsed_ms` and `last_line`. `--heartbeat-s1` adds a System One call per
+  tick, so costs one each.
 - `--no-s1`: skip the System One judgement (tiers 0 and 1 still run).
 - `--quiet`: no `watcher-s1 (log):` diagnostics on stderr.
 
@@ -72,9 +75,10 @@ verdict.
 | `failing` | `masked_failure` | Final. Exit 0, but the output shows a failure. Do not trust the success. |
 | `failing` | `exit`, `signal`, `timeout` | Final. Non-zero exit, killed by a signal, or killed by `--timeout`. Read the tail, fix, re-run. |
 | `failing` | `prompt_cancelled` | Final. `--on-prompt cancel` ended an unanswered prompt. Re-run non-interactively. |
+| any | `heartbeat` | Periodic liveness, state is the current one. No action unless the state is `stalled` or `waiting_on_input`. |
 | `done` | `exit` | Final. Exit 0 and nothing flags it. |
 
-A run ends with exactly one final event (`exit` is set). The `evidence_tail`
+A run ends with exactly one final event (`exit` is set); heartbeats are never final. The `evidence_tail`
 field carries the last lines of output; severity is `info`, `warn` or `error`.
 
 ## Stop a run

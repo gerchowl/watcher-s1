@@ -185,6 +185,18 @@ fn clip(s: &str, max: usize) -> String {
     }
 }
 
+/// `elapsed=12.3s last_line` for a heartbeat; its own `last_line` stands in
+/// for the evidence tail.
+fn heartbeat_tail(ev: &Value) -> String {
+    let elapsed = ev["elapsed_ms"]
+        .as_u64()
+        .map_or(String::new(), |ms| format!("elapsed={:.1}s", ms as f64 / 1000.0));
+    let last = ev["last_line"]
+        .as_str()
+        .map_or(String::new(), |l| clip(l.trim(), TAIL_CHARS));
+    format!("{elapsed} {last}").trim().to_owned()
+}
+
 /// `state reason severity exit s1 tail`
 pub fn format_event(ev: &Value) -> String {
     let exit = match (ev["exit"]["code"].as_i64(), ev["exit"]["signal"].as_i64()) {
@@ -193,10 +205,14 @@ pub fn format_event(ev: &Value) -> String {
         _ => "-".into(),
     };
     let s1 = ev["s1"]["fused"].as_f64().map_or("-".into(), |f| format!("s1={f:.2}"));
-    let tail = ev["evidence_tail"]
-        .as_str()
-        .and_then(|t| t.lines().rev().find(|l| !l.trim().is_empty()))
-        .map_or(String::new(), |l| clip(l.trim(), TAIL_CHARS));
+    let tail = if str_of(ev, "reason") == "heartbeat" {
+        heartbeat_tail(ev)
+    } else {
+        ev["evidence_tail"]
+            .as_str()
+            .and_then(|t| t.lines().rev().find(|l| !l.trim().is_empty()))
+            .map_or(String::new(), |l| clip(l.trim(), TAIL_CHARS))
+    };
     format!(
         "{} {} {} {exit} {s1} {tail}",
         str_of(ev, "state"),
@@ -370,7 +386,7 @@ impl Tail {
 /// `from_end`, skip whatever the file already holds. Waits for the file to
 /// appear; prints `watcher-s1 follow: watching FILE (offset N)` to stderr once
 /// it is open and positioned. Survives truncation, in-place reuse (see
-/// [`Tail::head`] for the detection limit) and rotation: when the path is
+/// `Tail`'s head cache for the detection limit) and rotation: when the path is
 /// replaced by a new file, the new file is read from its start while the old
 /// descriptor keeps being polled, since its producer may still be writing the
 /// run's remaining events (including the final one) there.
@@ -493,6 +509,21 @@ mod tests {
         assert_eq!(format_event(&v), "failing signal error signal=9 -");
         let v = serde_json::json!({"run_id": "r"});
         assert_eq!(format_event(&v), "- - - - -");
+    }
+
+    #[test]
+    fn heartbeats_show_elapsed_and_last_line_not_the_tail() {
+        let v = serde_json::json!({
+            "run_id": "r", "state": "progressing", "reason": "heartbeat", "severity": "info",
+            "exit": null, "s1": null, "evidence_tail": "old\n", "elapsed_ms": 12_345,
+            "bytes_since_last": 3, "lines_since_last": 1, "last_line": "compiling foo",
+        });
+        assert_eq!(
+            format_event(&v),
+            "progressing heartbeat info - - elapsed=12.3s compiling foo"
+        );
+        let v = serde_json::json!({"reason": "heartbeat", "elapsed_ms": 1000, "last_line": null});
+        assert_eq!(format_event(&v), "- heartbeat - - - elapsed=1.0s");
     }
 
     #[test]
