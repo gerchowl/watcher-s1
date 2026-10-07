@@ -12,15 +12,17 @@ const README: &str = include_str!("../README.md");
 
 /// Flags of other tools the docs mention. Anything else must be ours.
 const FOREIGN_FLAGS: &[&str] = &[
-    "--git",   // cargo install --git
-    "--repo",  // gh issue create
-    "--label", // gh issue create
-    "--title", // gh issue create
-    "--body",  // gh issue create
-    "--yes",   // the guide's "re-run non-interactively" hint
-    "--tag",   // cargo install
-    "--check", // cargo fmt --check
-    "--pid",   // README: the attach mode watcher-s1 deliberately lacks
+    "--git",                                   // cargo install --git
+    "--repo",                                  // gh issue create
+    "--label",                                 // gh issue create
+    "--title",                                 // gh issue create
+    "--body",                                  // gh issue create
+    "--yes",                                   // the guide's "re-run non-interactively" hint
+    "--tag",                                   // cargo install
+    "--check",                                 // cargo fmt --check
+    "--pid",                                   // README: the attach mode watcher-s1 deliberately lacks
+    "--no-default-features",                   // cargo build, the build without `mcp`
+    "--dangerously-load-development-channels", // claude, to load a development channel
 ];
 
 /// The CLI as clap builds it, which adds the generated `--help` (and, where
@@ -58,7 +60,7 @@ enum Scope {
 
 type Mention = (String, Scope);
 
-const SUBCOMMANDS: &[&str] = &["follow", "guide", "judge", "config"];
+const SUBCOMMANDS: &[&str] = &["follow", "guide", "judge", "config", "mcp"];
 
 /// The scope in effect after `watcher-s1` at byte `at` of `line`.
 fn scope_after(line: &str, at: usize) -> Scope {
@@ -213,11 +215,36 @@ fn the_allowlist_has_no_dead_entries() {
 #[test]
 fn the_scan_sees_subcommand_flags() {
     let real = real_flags();
-    for f in ["--new", "--posttooluse", "--s1-url", "--silence", "--events"] {
+    for f in [
+        "--new",
+        "--posttooluse",
+        "--s1-url",
+        "--silence",
+        "--events",
+        "--channel",
+        "--state-dir",
+    ] {
         assert!(real.contains(f), "{f}");
     }
     let seen = mentioned_flags("`--nope` and\n```bash\nwatcher-s1 --also-nope -- x\ncargo --skipped\n```\n");
     assert_eq!(seen, BTreeSet::from(["--nope".into(), "--also-nope".into()]));
+}
+
+/// Every flag of `watcher-s1 mcp` is documented in the README, under that
+/// subcommand's own scope (so a flag renamed in the CLI cannot linger in the
+/// docs, and a new one cannot go undocumented).
+#[test]
+fn the_readme_documents_every_mcp_flag() {
+    let sub = format!("{:?}", Scope::Sub("mcp".into()));
+    let mentioned: BTreeSet<String> = scoped(README)
+        .into_iter()
+        .filter(|(_, s)| *s == sub)
+        .map(|(f, _)| f)
+        .collect();
+    let mcp = built().find_subcommand("mcp").expect("the mcp subcommand").clone();
+    for f in own_flags(&mcp).into_iter().filter(|f| f != "--help") {
+        assert!(mentioned.contains(&f), "README never shows `watcher-s1 mcp {f}`");
+    }
 }
 
 fn scoped(doc: &str) -> Vec<(String, String)> {
