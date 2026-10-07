@@ -956,6 +956,9 @@ fn write_some(fd: RawFd, data: &[u8]) -> Option<usize> {
     }
 }
 
+/// Reads of one output per loop pass (64 KiB each).
+const MAX_READS_PER_PASS: usize = 16;
+
 /// Read what is available. `None` = EOF/EIO (the writer side is gone).
 fn read_some(fd: RawFd, buf: &mut [u8]) -> Option<usize> {
     loop {
@@ -1147,7 +1150,14 @@ pub fn run(opts: Options) -> Outcome {
         // Output: into the ring, and to the writer to tee through unchanged.
         let mut got_output = false;
         'outputs: for (i, (fd, is_err)) in sp.outputs.iter().enumerate() {
-            while open[i] && held.is_none() {
+            // A bounded number of reads per pass, so output that never stops
+            // coming cannot starve the rest of the loop: noticing the leader
+            // exit (which starts the drain cap), the timers, `--timeout` and
+            // the control socket. The poll above returns at once while data
+            // is waiting, so throughput is unaffected.
+            let mut reads = 0;
+            while open[i] && held.is_none() && reads < MAX_READS_PER_PASS {
+                reads += 1;
                 // The drain is bounded even while data keeps coming (a
                 // grandchild writing faster than our reader consumes).
                 if cap.is_some_and(|c| Instant::now() >= c) {

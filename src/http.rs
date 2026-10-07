@@ -184,8 +184,19 @@ impl DeadlineStream {
         if left.is_zero() {
             return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "deadline"));
         }
-        self.tcp.set_read_timeout(Some(left))?;
-        self.tcp.set_write_timeout(Some(left))
+        // Darwin answers EINVAL to setsockopt once the peer has shut the
+        // connection down. That means "closed": skip the bound and let the
+        // read or write that follows report it (EOF or an error).
+        for r in [
+            self.tcp.set_read_timeout(Some(left)),
+            self.tcp.set_write_timeout(Some(left)),
+        ] {
+            match r {
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+                other => other?,
+            }
+        }
+        Ok(())
     }
 }
 

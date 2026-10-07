@@ -1257,6 +1257,31 @@ mod tests {
     }
 
     #[test]
+    fn the_summary_converges_on_a_history_larger_than_one_budget() {
+        let (_d, runs, m) = runs_with("r");
+        // Far more than one 250 ms scan reads in a debug build.
+        let n = 400_000;
+        let line = ev("r", "progressing", "heartbeat", None);
+        append(&runs, "r", &line.repeat(n));
+        let (mut last, mut calls) = (0, 0);
+        loop {
+            let s = runs.summary(&m).unwrap();
+            calls += 1;
+            assert!(s.events > last || !s.partial, "call {calls} made no progress at {last}");
+            last = s.events;
+            if !s.partial {
+                assert_eq!(s.events, n as u64);
+                assert_eq!(s.last.unwrap().seq, n as u64);
+                break;
+            }
+            assert!(calls < 10_000, "no convergence");
+        }
+        // Settled: the next call is complete at once and the offset sticks.
+        let again = runs.summary(&m).unwrap();
+        assert!(!again.partial && again.events == n as u64);
+    }
+
+    #[test]
     fn a_replaced_events_file_voids_the_saved_position() {
         let (_d, runs, m) = runs_with("r");
         append(&runs, "r", &ev("r", "stalled", "silence", None).repeat(3));
