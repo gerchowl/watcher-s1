@@ -174,6 +174,7 @@ must ignore unknown fields).
 | `failing` | `masked_failure` | warn | exit 0, but System One's score ≥ the wrapper threshold (final event) |
 | `failing` | `exit` / `signal` / `timeout` | error | non-zero exit, death by signal, or killed by `--timeout` (final event) |
 | `failing` | `prompt_cancelled` | error | `--on-prompt cancel` cancelled an unanswered prompt (final event) |
+| `failing` | `stopped` | error | the run was stopped through its control socket, as the MCP `watch_stop` does: TERM to the group, KILL after the grace, the job's real signal exit (final event) |
 
 Every run ends with exactly one final event (`exit` non-null).
 
