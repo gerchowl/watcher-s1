@@ -832,7 +832,13 @@ fn responses_are_capped_and_a_sustained_producer_cannot_hold_a_wait() {
         let (stop, events) = (stop.clone(), events.clone());
         std::thread::spawn(move || {
             let block = ev("r", "progressing", "heartbeat", None).repeat(2000);
-            while !stop.load(Ordering::SeqCst) {
+            // Bounded volume (about 65 MiB): how much history the summary
+            // has to digest afterwards must not depend on how fast the
+            // machine runs the rest of the test.
+            for _ in 0..200 {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
                 append(&events, &block);
                 std::thread::sleep(Duration::from_millis(2));
             }
@@ -857,10 +863,21 @@ fn responses_are_capped_and_a_sustained_producer_cannot_hold_a_wait() {
     producer.join().unwrap();
     // Each status call scans a bounded amount and remembers where it got to:
     // repeated calls converge on the whole history.
-    until("the summary to catch up with the history", || {
+    // Wait on progress, not on a wall-clock guess: each call must advance the
+    // saved position (a stall fails after `BOUND` without progress); how long
+    // the whole history takes depends on the machine, and is not what is tested.
+    let (mut last, mut seen_at) = (0, Instant::now());
+    loop {
         let st = s.ok("watch_status", json!({"id": "1-0"}));
-        st["events"].as_u64().unwrap() >= 150_000 && st.get("partial").is_none()
-    });
+        let n = st["events"].as_u64().unwrap();
+        if n >= 150_000 && st.get("partial").is_none() {
+            break;
+        }
+        if n > last {
+            (last, seen_at) = (n, Instant::now());
+        }
+        assert!(seen_at.elapsed() < BOUND, "the summary stalled at {n} events: {st}");
+    }
     let size = std::fs::metadata(dir.path().join("runs/1-0/summary")).unwrap().len();
     assert!(size < 64 * 1024, "the summary stays small: {size}");
 }

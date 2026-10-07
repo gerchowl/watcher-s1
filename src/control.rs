@@ -277,6 +277,21 @@ impl std::fmt::Display for ClientError {
     }
 }
 
+/// Bound the socket's reads and writes. On Darwin `setsockopt` fails with
+/// `EINVAL` once the peer has shut the connection down (the server drops
+/// connections it will not serve, and may do so before we get here). That is
+/// "closed", not a fault: skip the bound and let the write or read that
+/// follows report the closed connection (an error or EOF, never a hang).
+fn set_timeouts(s: &UnixStream, timeout: Duration) -> io::Result<()> {
+    for r in [s.set_read_timeout(Some(timeout)), s.set_write_timeout(Some(timeout))] {
+        match r {
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput => {}
+            other => other?,
+        }
+    }
+    Ok(())
+}
+
 /// Send one request and read the one-line reply, within `timeout` overall
 /// for the read and write halves (connect to a local socket is immediate
 /// unless the supervisor's backlog is full, which the caller bounds by
@@ -284,8 +299,7 @@ impl std::fmt::Display for ClientError {
 pub fn request(path: &Path, req: &Value, timeout: Duration) -> Result<Value, ClientError> {
     let mut s = UnixStream::connect(path).map_err(ClientError::Unreachable)?;
     let io_err = |e: io::Error| ClientError::Failed(format!("control socket: {e}"));
-    s.set_read_timeout(Some(timeout)).map_err(io_err)?;
-    s.set_write_timeout(Some(timeout)).map_err(io_err)?;
+    set_timeouts(&s, timeout).map_err(io_err)?;
     writeln!(s, "{req}").map_err(io_err)?;
     let mut out = Vec::new();
     let deadline = Instant::now() + timeout;
@@ -389,19 +403,26 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("c.sock");
         let mut s = ControlServer::bind(&p).unwrap();
-        let mut idle = Us::connect(&p).unwrap(); // says nothing
-        let mut junk = Us::connect(&p).unwrap();
+        // Timeouts are set right after connecting, before the server can
+        // answer and close: on Darwin setsockopt on a socket whose peer has
+        // shut down fails with EINVAL.
+        let connect = || {
+            let c = Us::connect(&p).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            c
+        };
+        let mut idle = connect(); // says nothing
+        let mut junk = connect();
         junk.write_all(b"not json\n").unwrap();
-        let mut big = Us::connect(&p).unwrap();
+        let mut big = connect();
         big.write_all(&vec![b'x'; MAX_REQUEST + 10]).unwrap();
-        let mut unknown = Us::connect(&p).unwrap();
+        let mut unknown = connect();
         unknown.write_all(b"{\"op\":\"reboot\"}\n").unwrap();
         for _ in 0..20 {
             assert!(s.service(&|| reply_with("x")).is_none());
             std::thread::sleep(Duration::from_millis(5));
         }
         for c in [&mut junk, &mut big, &mut unknown] {
-            c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
             let mut text = String::new();
             c.read_to_string(&mut text).unwrap();
             assert!(text.contains("\"ok\":false"), "{text}");
