@@ -99,6 +99,7 @@ watcher-s1 config [--s1-url URL] [--s1-timeout SECS] [--config FILE]
 watcher-s1 judge --posttooluse [--s1-url URL] ...   # Claude Code hook, see below
 watcher-s1 follow [--new] [--timeout DUR] EVENTS_FILE  # stream events until the run ends (exit codes: `watcher-s1 guide`)
 watcher-s1 guide                                    # print the agent guide
+watcher-s1 mcp [--channel] [--state-dir DIR]        # MCP server on stdio, see "MCP server" below
 ```
 
 | Option | Default | Meaning |
@@ -312,6 +313,60 @@ watcher-s1 --silence 10m --timeout 2h --events /tmp/build.events -- nix build .#
   non-interactively) or `stalled` (silence / a `D`-state wedge).
 - Without `--events`, events land on stderr as `watcher-s1: {…}` lines, which
   the background task's output file captures alongside the command's output.
+
+### MCP server: `watcher-s1 mcp`
+
+For agents that speak MCP (Claude Code, Codex, ...), `watcher-s1 mcp` serves
+the supervisor over stdio, so an agent starts a job, goes on working, and
+asks for the verdict, with no shell juggling. It is part of the default
+build (cargo feature `mcp`; `cargo build --no-default-features` leaves it out
+and the subcommand then exits 2).
+
+Register it once:
+
+```bash
+claude mcp add watcher-s1 -- watcher-s1 mcp
+```
+
+| Tool | Does |
+|---|---|
+| `watch_start {cmd, cwd?, silence?, timeout?, heartbeat?, s1?}` | runs `cmd` (an argv array) as a fully wrapped `watcher-s1 --pipe --events ... -- cmd`, detached into its own session so it outlives the server and the session; returns the run `id` and the events and log paths |
+| `watch_wait {id, until, timeout_s?}` | blocks until the next unseen event (`until: "next"`) or the final one (`"final"`), or `timeout_s` (default 60); returns the events as JSON plus the compact `follow` lines. Works for runs an earlier server started |
+| `watch_status {id}` | last event, elapsed time, whether the watcher process is alive (`running`, `finished` or `lost`) |
+| `watch_stop {id, signal?, grace_s?}` | TERM to the watcher (which forwards it to the job's group); if the job is still there after `grace_s` (default 5), SIGKILL to the job's process group; never SIGKILLs the watcher |
+| `watch_list {limit?}` | runs, newest first, with state |
+
+The resource `watcher-s1://guide` is the same text as `watcher-s1 guide`.
+
+Runs live under `--state-dir` (default `$XDG_STATE_HOME/watcher-s1`, else
+`~/.local/state/watcher-s1`), in `runs/<id>/`: `events.jsonl`, `output.log`
+(the job's output only) and `meta.json` (command, cwd, start time, watcher pid,
+options). Runs older than 7 days are pruned when a server starts. The
+directory is the source of truth: a new server sees every run, and
+`watch_wait` remembers per run how many events it has handed out (a `cursor`
+file), so no event is delivered twice.
+
+stdout carries the protocol only; diagnostics go to stderr.
+
+#### Channels (opt-in, research preview)
+
+With `--channel` the server declares the experimental `claude/channel`
+capability and pushes one `notifications/claude/channel` message per edge
+event (`stalled`, `waiting_on_input`, `failing`, and the final event, never
+heartbeats) of the runs it started: the compact `follow` line as the content,
+`run_id` (the id the tools take), `state` and `reason` as `<channel>` tag
+attributes. Claude Code must be started with channels enabled for the server;
+while channels are a research preview, a custom server needs the development
+flag, which asks for confirmation:
+
+```bash
+claude mcp add watcher-s1 -- watcher-s1 mcp --channel
+claude --dangerously-load-development-channels server:watcher-s1
+```
+
+Team and Enterprise organisations must enable channels in their settings
+first. Without the flag the capability is simply ignored and the tools work
+as usual.
 
 ### PostToolUse hook: masked pipes
 

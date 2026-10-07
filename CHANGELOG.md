@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   survives truncation and rotation of the file); a test keeps the guide and README in step
   with the CLI flags and the event schema ([#19](https://github.com/gerchowl/watcher-s1/issues/19))
 
+- `watcher-s1 mcp [--channel] [--state-dir DIR]` serves the supervisor as an MCP server on stdio (official `rmcp` SDK, behind the `mcp` cargo feature, on by default): tools `watch_start`, `watch_wait`, `watch_status`, `watch_stop`, `watch_list` and the resource `watcher-s1://guide`; runs are detached watchers whose state lives under the state directory, so a later server can wait on them; `--channel` pushes edge events as Claude Code channel notifications ([#20](https://github.com/gerchowl/watcher-s1/issues/20))
+
 ### Changed
 
 ### Deprecated

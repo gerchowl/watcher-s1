@@ -93,6 +93,20 @@ job's process group, `kill -KILL -<pgid>` (`pgid` is in every event); the
 watcher then reports the signal exit truthfully. Never SIGKILL the watcher
 itself: it cannot forward anything and would orphan the job.
 
+## Over MCP
+
+If your client has the `watcher-s1` MCP server (`watcher-s1 mcp`), use its tools
+instead of the shell recipe above. `watch_start {cmd: [argv], silence?,
+timeout?, heartbeat?}` runs the job detached (it outlives the session) and
+returns an `id`. `watch_wait {id, until: "final", timeout_s}` blocks until the
+verdict (check `timed_out`, wait again if set); `until: "next"` returns events
+you have not seen. `watch_status {id}`, `watch_list` and `watch_stop {id}`
+cover the rest: stop sends TERM, then SIGKILL to the job's group after
+`grace_s` (default 5). Events and reactions are the same as below, and a new
+session can `watch_wait` on a run an earlier one started. With `--channel`,
+edge events arrive on their own as `<channel>` messages carrying the same
+`id` as `run_id`.
+
 ## Report problems
 
 If watcher-s1 misled you (missed a stall, false alarm, confusing output, wrong
