@@ -288,15 +288,16 @@
         "treefmt-nix": "treefmt-nix"
       },
       "locked": {
-        "lastModified": 1791192899,
+        "lastModified": 1791189913,
         "narHash": "sha256-c22pPy5+D4tNtwxlFEgAskb/LjPlHo6xrI+LpcJ9pQI=",
         "owner": "vig-os",
         "repo": "devkit",
-        "rev": "91083c037fcefaa230f7d6b63436ca5257d3c2f2",
+        "rev": "380006509659a3ca561dffc2ad1afd42f4fb10f3",
         "type": "github"
       },
       "original": {
         "owner": "vig-os",
+        "ref": "1.18.0",
         "repo": "devkit",
         "type": "github"
       }

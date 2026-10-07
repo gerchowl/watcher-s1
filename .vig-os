@@ -251,7 +251,7 @@ DEVKIT_UPGRADE_EXCLUDE=
 # of this knob on a pinned consumer is remedied in one commit: bump the pin, run
 # `nix flake update <input>`, set this key. Written back only for a non-empty
 # value (#1752).
-DEVKIT_FLAKE_PIN_ADVANCE=
+DEVKIT_FLAKE_PIN_ADVANCE=true
 
 # Scaffold-drift CI gate: true (default) | false. Empty (= unset) resolves to
 # `true` — ci.yml's `scaffold-drift` job re-runs the pinned devkit version's
