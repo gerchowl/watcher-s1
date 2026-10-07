@@ -59,8 +59,9 @@ verdict.
 - `--events FILE`: where events go. Without it they land on stderr.
 - `--pipe`: plain pipes instead of a PTY.
 - `--heartbeat DUR` (min `1s`, with `--events`): a periodic `heartbeat` event
-  with `elapsed_ms` and `last_line`. `--heartbeat-s1` adds a System One call per
-  tick, so costs one each.
+  with `elapsed_ms` and `last_line`. `--heartbeat-s1` opts into System One
+  verdicts on heartbeats: at most one request in flight, so a tick may skip
+  the call and carry `s1: null`.
 - `--no-s1`: skip the System One judgement (tiers 0 and 1 still run).
 - `--quiet`: no `watcher-s1 (log):` diagnostics on stderr.
 

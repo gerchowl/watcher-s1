@@ -4,7 +4,7 @@
 //! Timing discipline: tests synchronise on observed events and release the
 //! child through a gate file instead of sleeping and hoping; where a time
 //! matters it is a floor (a tick can never come early), never a ceiling a
-//! descheduled watcher could break; and verdict assertions tolerate the
+//! descheduled watcher could break (grid precision lives in unit tests); and verdict assertions tolerate the
 //! correct fail-open `null`.
 
 mod common;
@@ -111,13 +111,15 @@ fn heartbeats_then_the_final_event() {
             (h["bytes_since_last"].as_u64(), h["lines_since_last"].as_u64()),
             (Some(0), Some(0))
         );
-        // On the grid: never before its tick, and nearest to a distinct
-        // multiple of 2 s (the margin stays under half an interval).
+        // Never before its tick, one per grid point. How late a tick may
+        // be is the scheduler's business (a descheduled watcher is still a
+        // correct one): the exact grid arithmetic and coalescing are
+        // pinned deterministically by the `supervise` unit tests.
         let at = h["elapsed_ms"].as_u64().unwrap();
         let k = (at + 1000) / 2000;
         assert!(k > prev, "ticks go forward, one per grid point: {st:?}");
         prev = k;
-        assert!(at >= 2000 * k && at - 2000 * k < 900, "tick {k} at {at} ms");
+        assert!(at >= 2000 * k, "tick {k} at {at} ms came early");
         // One key for all of a job's heartbeats, distinct from the final's.
         assert!(h["dedup_key"].as_str().unwrap().contains(":heartbeat:"));
         assert_eq!(h["dedup_key"], hb[0]["dedup_key"]);
@@ -615,4 +617,71 @@ fn a_stalled_event_reader_never_freezes_the_timeout() {
         "{:?}",
         states(&ev)
     );
+}
+
+/// The reviewer's repro (#26, B3): the default, non-quiet stderr sink on a
+/// pipe nobody reads. Events and the supervisor's own diagnostics share that
+/// stream; neither may hold the loop up, so the timeout and the kill happen
+/// on schedule while stderr is blocked.
+#[test]
+fn a_stalled_stderr_never_freezes_the_timeout() {
+    let e = Env::new();
+    let (mut r, w, filler) = stalled_pipe();
+    assert!(filler > 4096);
+    let pidfile = e.path("sleep.pid");
+    let mut c: Command = e.cmd_bare(); // no --events, no -q: stderr is the sink
+    c.args([
+        "--no-s1",
+        "--pipe",
+        "--heartbeat",
+        "1s",
+        "--silence",
+        "0",
+        "--timeout",
+        "3s",
+        "--kill-grace",
+        "0.1s",
+        "--",
+        "sh",
+        "-c",
+        "echo $$ > \"$1\"; exec sleep 60",
+        "sh",
+    ])
+    .arg(&pidfile)
+    .stdout(Stdio::null())
+    .stderr(Stdio::from(w)); // the watcher holds the only write end
+    let mut child = c.spawn().unwrap();
+    drop(c);
+    // The child announces itself through a file, not through stderr.
+    assert!(wait_until(LIMIT, || std::fs::read_to_string(&pidfile)
+        .is_ok_and(|s| s.trim().parse::<i32>().is_ok())));
+    let sleeper: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+    let t0 = Instant::now();
+    // timeout 3 s + grace 0.1 s + generous slack; a frozen loop never gets here.
+    let killed = wait_until(Duration::from_secs(20), || !alive(sleeper));
+    let took = t0.elapsed();
+    assert!(
+        killed,
+        "the child outlived --timeout behind a stalled stderr ({took:?})"
+    );
+    // The final flush waits for the reader, like any write to a full pipe.
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "exited without delivering the final event"
+    );
+    // Drain: whole lines, the final event last, diagnostics between them.
+    let mut got = String::new();
+    r.read_to_string(&mut got).unwrap();
+    let st = child.wait().unwrap();
+    assert!(st.signal().is_some() || st.code().is_some());
+    let prefix = watcher_s1::event::STDERR_PREFIX;
+    let own: Vec<&str> = got.lines().filter_map(|l| l.strip_prefix(prefix)).collect();
+    std::fs::write(e.path("events.jsonl"), own.join("\n") + "\n").unwrap();
+    let ev = e.events(); // parses and schema-validates every line
+    let l = last(&ev);
+    assert_eq!(
+        (l["state"].as_str(), l["reason"].as_str()),
+        (Some("failing"), Some("timeout"))
+    );
+    assert!(got.contains("SIGTERM to process group"), "the diagnostic arrived too");
 }
