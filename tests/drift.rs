@@ -23,15 +23,22 @@ const FOREIGN_FLAGS: &[&str] = &[
     "--pid",   // README: the attach mode watcher-s1 deliberately lacks
 ];
 
+/// The CLI as clap builds it, which adds the generated `--help` (and, where
+/// the command has one, `--version`) to each command.
+fn built() -> clap::Command {
+    let mut c = Cli::command();
+    c.build();
+    c
+}
+
 /// Every `--long` flag of the CLI, subcommands included.
 fn real_flags() -> BTreeSet<String> {
     fn walk(c: &clap::Command, out: &mut BTreeSet<String>) {
-        out.extend(c.get_arguments().filter_map(|a| a.get_long()).map(|l| format!("--{l}")));
+        out.extend(own_flags(c));
         c.get_subcommands().for_each(|s| walk(s, out));
     }
     let mut out = BTreeSet::new();
-    walk(&Cli::command(), &mut out);
-    out.extend(["--help", "--version"].map(String::from));
+    walk(&built(), &mut out);
     out
 }
 
@@ -44,6 +51,9 @@ enum Scope {
     Wrap,
     /// `watcher-s1 <sub> ...`.
     Sub(String),
+    /// After a bare `--`: the wrapped command's own flags. Only the explicit
+    /// `FOREIGN_FLAGS` allowlist covers these.
+    Foreign,
 }
 
 type Mention = (String, Scope);
@@ -93,6 +103,7 @@ fn code_line_mentions(
         let from = applied.unwrap_or(0);
         if *past || line[from..m.start()].split_whitespace().any(|t| t == "--") {
             *past = true;
+            out.push((m.as_str().to_string(), Scope::Foreign));
             continue;
         }
         out.push((m.as_str().to_string(), scope.clone()));
@@ -141,34 +152,38 @@ fn mentioned_flags(doc: &str) -> BTreeSet<String> {
     mentioned(doc).into_iter().map(|(f, _)| f).collect()
 }
 
-/// Long flags of one command (not its subcommands), plus clap's built-ins.
+/// Long flags of one built command (not its subcommands), generated ones
+/// included.
 fn own_flags(c: &clap::Command) -> BTreeSet<String> {
-    let mut out: BTreeSet<String> = c
-        .get_arguments()
+    c.get_arguments()
         .filter_map(|a| a.get_long())
         .map(|l| format!("--{l}"))
-        .collect();
-    out.extend(["--help", "--version"].map(String::from));
-    out
+        .collect()
 }
 
 fn scope_flags(scope: &Scope) -> BTreeSet<String> {
     match scope {
         Scope::Any => real_flags(),
-        Scope::Wrap => own_flags(&Cli::command()),
+        Scope::Wrap => own_flags(&built()),
         Scope::Sub(name) => own_flags(
-            Cli::command()
+            built()
                 .find_subcommand(name)
                 .unwrap_or_else(|| panic!("no subcommand {name}")),
         ),
+        Scope::Foreign => BTreeSet::new(),
     }
 }
 
-fn check_flags(name: &str, doc: &str) {
-    let bad: Vec<_> = mentioned(doc)
+/// Mentions that neither their command nor the foreign allowlist has.
+fn unknown(doc: &str) -> Vec<Mention> {
+    mentioned(doc)
         .into_iter()
         .filter(|(f, scope)| !scope_flags(scope).contains(f) && !FOREIGN_FLAGS.contains(&f.as_str()))
-        .collect();
+        .collect()
+}
+
+fn check_flags(name: &str, doc: &str) {
+    let bad = unknown(doc);
     assert!(
         bad.is_empty(),
         "{name} mentions flags that their command does not have: {bad:?} (typo, wrong subcommand, or add to FOREIGN_FLAGS if another tool's)"
@@ -281,4 +296,41 @@ fn guide_event_table_matches_the_schema() {
         schema_enum(&schema, "reason"),
         "guide reasons vs event.schema.json"
     );
+}
+
+fn bad_flags(doc: &str) -> Vec<String> {
+    unknown(doc).into_iter().map(|(f, _)| f).collect()
+}
+
+#[test]
+fn foreign_flags_after_the_separator_need_the_allowlist() {
+    // Not allowlisted: flagged, not silently discarded.
+    assert_eq!(
+        bad_flags("```bash\nwatcher-s1 -- cargo --new-foreign-flag\n```\n"),
+        ["--new-foreign-flag"]
+    );
+    // Allowlisted ones pass, and a continuation after `--` stays foreign.
+    assert!(bad_flags("```bash\nwatcher-s1 -- cargo install --git x\n```\n").is_empty());
+    assert_eq!(
+        bad_flags("```bash\nwatcher-s1 -- cargo \\\n  --also-foreign\n```\n"),
+        ["--also-foreign"]
+    );
+    // Our own flag is not an excuse after `--`: it is the child's flag there.
+    assert_eq!(
+        bad_flags("```bash\nwatcher-s1 -- cargo --silence 1\n```\n"),
+        ["--silence"]
+    );
+}
+
+#[test]
+fn generated_flags_come_from_clap_per_command() {
+    // `follow` has --help but no --version; the binary rejects it too.
+    assert_eq!(
+        bad_flags("```bash\nwatcher-s1 follow --version E\n```\n"),
+        ["--version"]
+    );
+    assert!(bad_flags("```bash\nwatcher-s1 follow --help\n```\n").is_empty());
+    assert!(bad_flags("```bash\nwatcher-s1 --version\nwatcher-s1 --help\n```\n").is_empty());
+    assert!(scope_flags(&Scope::Wrap).contains("--version"));
+    assert!(!scope_flags(&Scope::Sub("guide".into())).contains("--version"));
 }
