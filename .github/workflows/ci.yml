@@ -422,10 +422,10 @@ jobs:
           # A release PR (release/* -> main) spans pre-migration history that
           # predates the commit gate. Those commits were gated (or
           # grandfathered) on their way into the trunk branch, so exclude
-          # anything already reachable from origin/main — a no-op on a main PR
-          # (its base IS main) that only tightens the release-PR range (#1149).
+          # anything already reachable from origin/dev — a no-op on a dev PR
+          # (its base IS dev) that only tightens the release-PR range (#1149).
           EXCLUDE=()
-          TRUNK="main"
+          TRUNK="dev"
           if [ "${BASE_REF}" != "${TRUNK}" ] && \
              git fetch --no-tags --quiet origin "${TRUNK}" 2>/dev/null; then
             EXCLUDE+=(--exclude-reachable "origin/${TRUNK}")

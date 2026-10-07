@@ -90,7 +90,7 @@ jobs:
         with:
           # Base branch per workflow model: gitflow -> dev, trunk -> main
           # (retargeted to `main` at scaffold time for a trunk repo).
-          ref: main
+          ref: dev
           # Persist the minted token so the later push authenticates as the
           # upgrade identity (whose PR triggers CI).
           token: ${{ steps.app-token.outputs.token }}
@@ -411,7 +411,7 @@ jobs:
           HOOK_DRIFT: ${{ steps.upgrade.outputs.hook-drift }}
           HOOK_RECONCILE: ${{ steps.upgrade.outputs.hook-reconcile }}
           # PR base per workflow model (retargeted dev -> main at scaffold time).
-          BASE: main
+          BASE: dev
         run: |
           set -euo pipefail
           # No adoption issue and no auto-close marker (#1405): a no-diff run

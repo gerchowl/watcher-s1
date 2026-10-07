@@ -23,9 +23,9 @@ on:  # yamllint disable-line rule:truthy
         default: false
         type: boolean
       target-branch:
-        description: 'Target branch to commit changes to (e.g., main, release/x.y.z).'
+        description: 'Target branch to commit changes to (e.g., dev, release/x.y.z).'
         required: false
-        default: 'main'
+        default: 'dev'
         type: string
       output-dir:
         description: 'Directory to write synced issue/PR files to.'
@@ -101,7 +101,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          ref: ${{ github.event.inputs.target-branch || 'main' }}
+          ref: ${{ github.event.inputs.target-branch || 'dev' }}
           persist-credentials: false
 
       - name: Set up devkit toolchain
@@ -192,7 +192,7 @@ jobs:
           # Use App token so push can bypass branch protection when App is in bypass list
           GH_TOKEN: ${{ steps.generate-token.outputs.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          TARGET_BRANCH: refs/heads/${{ github.event.inputs.target-branch || 'main' }}
+          TARGET_BRANCH: refs/heads/${{ github.event.inputs.target-branch || 'dev' }}
           MAX_ATTEMPTS: "3"
           COMMIT_MESSAGE: "${{ github.event.inputs.commit-msg || 'chore: sync issues and PRs' }}"
           FILE_PATHS: ${{ steps.sync.outputs.modified-files }}
