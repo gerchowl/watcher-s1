@@ -8,6 +8,7 @@ pub mod breaker;
 pub mod cli;
 pub mod config;
 pub mod detect;
+pub mod diag;
 pub mod event;
 pub mod follow;
 pub mod http;

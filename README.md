@@ -64,8 +64,11 @@ only wraps (`watcher-s1 -- cmd`) or passively follows a log file
   stderr cannot freeze `--timeout`, signal forwarding or heartbeats. When the
   queue is full: heartbeats are dropped (the next one that gets through
   carries `heartbeats_dropped`), other events wait in a bounded overflow
-  queue (1024, oldest dropped with a stderr diagnostic unless `-q`), and event
-  order is kept. The final event is written after everything queued; like any
+  queue (1024, oldest dropped with a diagnostic unless `-q`), and event
+  order is kept. The watcher's own `watcher-s1 (log):` diagnostics and events
+  on the default stderr sink share one stderr writer thread behind a bounded
+  queue: a full queue drops (and counts) diagnostics instead of blocking, so a
+  stalled stderr cannot hold up `--timeout` either. The final event is written after everything queued; like any
   process writing to a full pipe, watcher-s1 may block at exit on an event
   sink nobody reads.
 - **Fail open.** If System One is not configured, down or slow, the event
@@ -81,14 +84,14 @@ inputs.watcher-s1.url = "github:gerchowl/watcher-s1";
 environment.systemPackages = [ inputs.watcher-s1.packages.${system}.default ];
 ```
 
-Pin a release with `github:gerchowl/watcher-s1?ref=v0.1.0`.
+Pin a release with `github:gerchowl/watcher-s1?ref=v0.2.0`.
 
 Without Nix:
 - **Release binaries:** every GitHub Release carries
   `watcher-s1-<tag>-<target>.tar.gz` plus `.sha256`, for
   `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` (fully static,
   any distribution) and `aarch64-apple-darwin`.
-- **From source:** `cargo install --git https://github.com/gerchowl/watcher-s1 --tag v0.1.0`.
+- **From source:** `cargo install --git https://github.com/gerchowl/watcher-s1 --tag v0.2.0`.
 - **Ad hoc:** `nix run github:gerchowl/watcher-s1 -- -- make test`.
 
 ## Usage
