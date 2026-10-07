@@ -46,6 +46,19 @@ jobs:
           rustup target add "$TARGET"
           cargo build --release --locked --target "$TARGET"
 
+      - name: Check the binary's version matches the tag
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          want="${TAG#v}"
+          got="$("target/$TARGET/release/watcher-s1" --version | awk '{print $2}')"
+          if [ "$got" != "$want" ]; then
+            echo "::error::binary reports version '$got' but the tag is '$TAG' (expected '$want'): bump Cargo.toml and Cargo.lock before tagging"
+            exit 1
+          fi
+
       - name: Package
         env:
           TARGET: ${{ matrix.target }}
