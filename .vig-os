@@ -22,7 +22,7 @@ DEVKIT_MODE=direnv
 # branch and sync-main-to-dev.yml disappear. Realized entirely at scaffold time
 # (an anchored dev->main render + a sync-main-to-dev copy-exclude), mirroring
 # DEVKIT_MODE. Written back only for trunk, so a gitflow .vig-os is unchanged (#1205).
-DEVKIT_WORKFLOW=trunk
+DEVKIT_WORKFLOW=gitflow
 
 # Project identity (persisted SHORT_NAME / ORG_NAME / GITHUB_REPOSITORY);
 # written back by init-workspace.sh — edit only to deliberately rename.
