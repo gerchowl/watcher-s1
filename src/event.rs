@@ -96,9 +96,13 @@ pub struct Heartbeat {
     pub lines_since_last: u64,
     /// Last non-empty line, ANSI stripped, at most [`LAST_LINE_MAX`] chars.
     pub last_line: Option<String>,
+    /// Heartbeats dropped since the previous one that was delivered, because
+    /// the event sink was not keeping up. Absent when none were.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heartbeats_dropped: Option<u64>,
 }
 
-pub const LAST_LINE_MAX: usize = 200;
+pub const LAST_LINE_MAX: usize = crate::ring::LineTracker::MAX;
 
 /// Run-scoped fields every event of one watcher shares.
 #[derive(Debug, Clone)]
@@ -377,6 +381,7 @@ mod tests {
             bytes_since_last: 1,
             lines_since_last: 1,
             last_line,
+            heartbeats_dropped: None,
         };
         let a = run.heartbeat(State::Progressing, String::new(), hb(None));
         let b = run.heartbeat(State::Stalled, String::new(), hb(Some("x".into())));

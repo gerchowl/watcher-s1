@@ -8,6 +8,7 @@ pub mod detect;
 pub mod event;
 pub mod http;
 pub mod judge;
+pub mod outbox;
 pub mod probe;
 pub mod questions;
 pub mod ring;

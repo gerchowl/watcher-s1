@@ -22,7 +22,7 @@
     "pgid": { "type": "integer", "description": "The child's process group (== pid: the child leads its own group)." },
     "state": {
       "enum": ["progressing", "stalled", "waiting_on_input", "failing", "done"],
-      "description": "progressing: output resumed after a stall. stalled: silence threshold or a blocked (D/U) process. waiting_on_input: an unanswered prompt. failing: non-zero exit, death by signal, timeout kill, or System One flags the output. done: exit 0 and nothing flags it."
+      "description": "progressing: output resumed after a stall (reason resumed), or, on a heartbeat, no stall or prompt episode is open. stalled: silence threshold or a blocked (D/U) process. waiting_on_input: an unanswered prompt. failing: non-zero exit, death by signal, timeout kill, or System One flags the output. done: exit 0 and nothing flags it."
     },
     "reason": {
       "enum": ["exit", "signal", "timeout", "prompt_cancelled", "silence", "blocked", "prompt", "resumed", "masked_failure", "heartbeat"],
@@ -47,7 +47,7 @@
     "dedup_key": {
       "type": "string",
       "pattern": "^watcher-s1:[^:]+:[a-z_]+:[0-9a-f]{16}$",
-      "description": "watcher-s1:<host>:<state>:<fnv1a64(cmd)>; stable across runs of the same command."
+      "description": "watcher-s1:<host>:<state>:<fnv1a64(cmd)>; stable across runs of the same command. Heartbeats use the literal segment `heartbeat` instead of the state, so all of a job's heartbeats share one key."
     },
     "caused_by": { "type": ["string", "null"], "description": "The parent watcher's run_id (from WATCHER_S1_PARENT), or null." },
     "evidence_tail": { "type": "string", "description": "The last lines of output, ANSI stripped." },
@@ -97,7 +97,8 @@
     "elapsed_ms": { "type": "integer", "minimum": 0, "description": "Optional, heartbeat only. Milliseconds since the watcher started the command (since attach in --log mode)." },
     "bytes_since_last": { "type": "integer", "minimum": 0, "description": "Optional, heartbeat only. Child output bytes since the previous heartbeat (or start)." },
     "lines_since_last": { "type": "integer", "minimum": 0, "description": "Optional, heartbeat only. Child output lines (newlines) since the previous heartbeat (or start)." },
-    "last_line": { "type": ["string", "null"], "maxLength": 200, "description": "Optional, heartbeat only. The last non-empty output line, ANSI stripped, truncated to 200 characters; null when there is none." }
+    "last_line": { "type": ["string", "null"], "maxLength": 200, "description": "Optional, heartbeat only. The last non-empty output line, ANSI stripped, truncated to 200 characters; null when there is none." },
+    "heartbeats_dropped": { "type": "integer", "minimum": 1, "description": "Optional, heartbeat only. How many heartbeats were dropped since the previous delivered one because the event sink was not keeping up (a full pipe or an unread --events-fd). Absent when none were." }
   },
   "additionalProperties": true
 }

@@ -3,12 +3,11 @@
 //! sideband events, and report its exit truthfully.
 
 use crate::detect;
-use crate::event::{
-    BlockedProc, ENV_PARENT, Event, Exit, Heartbeat, LAST_LINE_MAX, ProcInfo, RunInfo, Severity, Sink, State,
-};
+use crate::event::{BlockedProc, ENV_PARENT, Event, Exit, Heartbeat, ProcInfo, RunInfo, Severity, Sink, State};
+use crate::outbox::Outbox;
 use crate::probe::{Prober, Sample, sample_tree};
 use crate::questions::Surface;
-use crate::ring::{self, Ring};
+use crate::ring::{self, LineTracker, Ring};
 use crate::s1::{Client, Verdict};
 use nix::sys::signal::{Signal, kill};
 use nix::sys::termios::{self, LocalFlags, OutputFlags, SetArg, Termios};
@@ -46,7 +45,7 @@ pub struct Options {
     pub heartbeat_s1: bool,
     pub evidence_bytes: usize,
     pub s1: Option<Arc<Client>>,
-    pub sink: Sink,
+    pub sink: Arc<Sink>,
     pub quiet: bool,
 }
 
@@ -331,6 +330,10 @@ struct Watch<'a> {
     opts: &'a Options,
     run: RunInfo,
     ring: Ring,
+    /// The last non-empty line, tracked apart from the (evicting) ring.
+    last_line: LineTracker,
+    /// Event transport: every event leaves through the writer thread.
+    out: Outbox,
     start: Instant,
     last_output: Instant,
     /// Warn-level events emitted in the current quiet episode.
@@ -366,6 +369,8 @@ impl<'a> Watch<'a> {
             opts,
             run,
             ring: Ring::new(ring::DEFAULT_CAPACITY),
+            last_line: LineTracker::default(),
+            out: Outbox::start(opts.sink.clone(), opts.quiet),
             start: now,
             last_output: now,
             episode_warned: false,
@@ -404,18 +409,27 @@ impl<'a> Watch<'a> {
         if ev.severity >= Severity::Warn {
             self.episode_warned = true;
         }
-        self.opts.sink.emit(ev);
+        self.out.send(ev.clone());
+    }
+
+    /// Take in bytes that were already there (log attach): they count for
+    /// the evidence and the last line, not as new output.
+    fn prime(&mut self, data: &[u8]) {
+        self.ring.push(data);
+        self.last_line.feed(data);
+        self.hb_bytes = self.ring.total_bytes();
     }
 
     fn on_output(&mut self, data: &[u8]) {
         self.ring.push(data);
+        self.last_line.feed(data);
         self.lines += data.iter().filter(|&&b| b == b'\n').count() as u64;
         self.last_output = Instant::now();
         if self.episode_warned {
             let ev = self
                 .run
                 .event(State::Progressing, Severity::Info, "resumed", self.evidence());
-            self.opts.sink.emit(&ev);
+            self.out.send(ev);
         }
         self.episode_warned = false;
         self.stall_done = false;
@@ -458,18 +472,14 @@ impl<'a> Watch<'a> {
     /// output counters but touches neither them nor the silence timer or the
     /// episode flags: a heartbeat is our output, not the child's.
     fn heartbeat_event(&mut self, now: Instant) -> Event {
-        let text = self.ring.text();
-        let last_line = text
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .map(|l| l.chars().take(LAST_LINE_MAX).collect());
+        let last_line = self.last_line.last_line();
         let (bytes, lines) = (self.ring.total_bytes(), self.lines);
         let hb = Heartbeat {
             elapsed_ms: now.duration_since(self.start).as_millis() as u64,
             bytes_since_last: bytes - self.hb_bytes,
             lines_since_last: lines - self.hb_lines,
             last_line,
+            heartbeats_dropped: None,
         };
         (self.hb_bytes, self.hb_lines) = (bytes, lines);
         self.run.heartbeat(self.episode_state(), self.evidence(), hb)
@@ -490,7 +500,7 @@ impl<'a> Watch<'a> {
                     out = q.tick(ev, || self.judge_async(&client));
                     self.pending_heartbeats = q;
                 }
-                None => self.opts.sink.emit(&ev),
+                None => self.out.send_heartbeat(ev),
             }
         } else {
             out = self.pending_heartbeats.poll();
@@ -501,12 +511,12 @@ impl<'a> Watch<'a> {
     }
 
     /// Attach a verdict (or fail open without one); the state never changes.
-    fn emit_heartbeat(&self, mut ev: Event, res: Result<Verdict, String>) {
+    fn emit_heartbeat(&mut self, mut ev: Event, res: Result<Verdict, String>) {
         match res {
             Ok(v) => ev.s1 = Some(v),
             Err(e) => log(self.opts.quiet, &format!("System One unavailable, failing open: {e}")),
         }
-        self.opts.sink.emit(&ev);
+        self.out.send_heartbeat(ev);
     }
 
     /// Before the final event (or on a signal exit): release the pending
@@ -1156,6 +1166,7 @@ pub fn run(opts: Options) -> Outcome {
                 w.tick(now);
             }
         }
+        w.out.pump();
         // Leave once every output is closed, or once the grace for new data
         // is over AND a full read pass found nothing, or at the 3 s cap. So
         // the output a child leaves behind is teed even behind a slow reader,
@@ -1206,7 +1217,9 @@ pub fn run(opts: Options) -> Outcome {
     }
     w.flush_heartbeats();
     let ev = final_event(&w, outcome);
-    opts.sink.emit(&ev);
+    // Everything queued first, then the final event; may block on a sink
+    // nobody reads (see `outbox`).
+    w.out.finish(Some(ev));
     outcome
 }
 
@@ -1241,8 +1254,7 @@ pub fn run_log(opts: Options, path: &std::path::Path) -> Outcome {
         let mut prime = Vec::new();
         f.seek(SeekFrom::Start(start)).ok()?;
         Read::by_ref(&mut f).take(len - start).read_to_end(&mut prime).ok()?;
-        w.ring.push(&prime);
-        w.hb_bytes = w.ring.total_bytes(); // what was already there is not "since last"
+        w.prime(&prime);
         Some((f, len, meta.ino()))
     };
     let mut file = open_at_end(&mut w);
@@ -1270,6 +1282,7 @@ pub fn run_log(opts: Options, path: &std::path::Path) -> Outcome {
             {
                 // Pending heartbeats are emitted fail-open, not dropped.
                 w.flush_heartbeats();
+                w.out.finish(None);
                 return Outcome::Signal(s as libc::c_int);
             }
         }
@@ -1293,6 +1306,7 @@ pub fn run_log(opts: Options, path: &std::path::Path) -> Outcome {
             }
         }
         w.tick(Instant::now());
+        w.out.pump();
     }
 }
 
@@ -1380,30 +1394,39 @@ pub fn exit_like(outcome: Outcome) -> ! {
 /// How long the final event (or a signal exit) waits for a heartbeat verdict.
 const HB_FLUSH_BOUND: Duration = Duration::from_millis(250);
 
-/// Heartbeats waiting for their System One verdict. Liveness beats verdicts:
-///  - at most ONE System One request is in flight for heartbeats;
-///  - if it is still pending when the next tick is due, it is emitted with
-///    `s1: null` (fail-open) and that tick's heartbeat goes out at once with
-///    `s1: null` and no new request, so a slow endpoint never delays or
-///    queues up heartbeats;
+/// Heartbeats waiting for their System One verdict. Liveness beats verdicts,
+/// and a request is never forgotten while it runs:
+///  - at most ONE System One request is in flight for heartbeats, tracked by
+///    its receiver for as long as the worker lives, whether or not an event
+///    still awaits its verdict;
+///  - if it is still pending when the next tick is due, the awaiting event is
+///    emitted with `s1: null` (fail-open) and that tick's heartbeat goes out
+///    at once with `s1: null`; the receiver is kept, and no new request
+///    starts until the worker returns (its late verdict is discarded) or
+///    disconnects, so a slow endpoint never sees overlapping requests nor
+///    delays or queues up heartbeats;
 ///  - a ready verdict is released as soon as it is seen; a worker that died
 ///    (channel disconnected) is released fail-open, never waited for.
 struct HbQueue<E, V> {
-    pending: Option<(Receiver<Result<V, String>>, E)>,
+    /// The worker's receiver and, while it is within its tick, the heartbeat
+    /// awaiting the verdict (`None` once that event went out overdue).
+    inflight: Option<Inflight<E, V>>,
 }
 
 impl<E, V> Default for HbQueue<E, V> {
     fn default() -> Self {
-        Self { pending: None }
+        Self { inflight: None }
     }
 }
 
+type Inflight<E, V> = (Receiver<Result<V, String>>, Option<E>);
 type Released<E, V> = Vec<(E, Result<V, String>)>;
 
 impl<E, V> HbQueue<E, V> {
-    /// Release the pending entry if its verdict is ready or its worker died.
+    /// Retire the worker if it returned or died; release the event awaiting
+    /// its verdict, if there still is one.
     fn poll(&mut self) -> Released<E, V> {
-        let Some((rx, _)) = &self.pending else {
+        let Some((rx, _)) = &self.inflight else {
             return Vec::new();
         };
         let res = match rx.try_recv() {
@@ -1411,26 +1434,32 @@ impl<E, V> HbQueue<E, V> {
             Err(mpsc::TryRecvError::Empty) => return Vec::new(),
             Err(mpsc::TryRecvError::Disconnected) => Err("judge worker died".into()),
         };
-        let (_, ev) = self.pending.take().unwrap();
-        vec![(ev, res)]
+        match self.inflight.take() {
+            Some((_, Some(ev))) => vec![(ev, res)],
+            _ => Vec::new(),
+        }
     }
 
     /// A tick is due with heartbeat `ev`: returns what to emit now, in order.
     /// `spawn` starts the System One request, only if none is in flight.
     fn tick(&mut self, ev: E, spawn: impl FnOnce() -> Receiver<Result<V, String>>) -> Released<E, V> {
         let mut out = self.poll();
-        if let Some((_, old)) = self.pending.take() {
-            out.push((old, Err("verdict not ready by the next tick".into())));
-            out.push((ev, Err("previous request still in flight".into())));
-        } else {
-            self.pending = Some((spawn(), ev));
+        match &mut self.inflight {
+            None => self.inflight = Some((spawn(), Some(ev))),
+            Some((_, awaiting)) => {
+                if let Some(old) = awaiting.take() {
+                    out.push((old, Err("verdict not ready by the next tick".into())));
+                }
+                out.push((ev, Err("previous request still in flight".into())));
+            }
         }
         out
     }
 
-    /// Release everything, waiting at most `bound` in total, else fail open.
+    /// Release the awaiting event, waiting at most `bound`, else fail open.
+    /// A stale worker (its event already out) is never waited for.
     fn flush(&mut self, bound: Duration) -> Released<E, V> {
-        let Some((rx, ev)) = self.pending.take() else {
+        let Some((rx, Some(ev))) = self.inflight.take() else {
             return Vec::new();
         };
         let res = match rx.recv_timeout(bound) {
@@ -1459,22 +1488,44 @@ mod tests {
         let (tx1, rx1) = chan();
         assert!(q.tick(1, || rx1).is_empty(), "held for its verdict");
         assert!(q.poll().is_empty(), "not ready: still held");
-        // Next tick, verdict still missing: head out null, tick 2 out at once,
-        // no new request (the closure must not run).
+        // Next tick, verdict still missing: head out null, tick 2 out at once.
         let out = q.tick(2, || unreachable!("one request in flight at most"));
         assert_eq!(
             out.iter().map(|(e, r)| (*e, r.is_ok())).collect::<Vec<_>>(),
             [(1, false), (2, false)]
         );
-        assert!(q.pending.is_none());
-        drop(tx1);
-        // The tick after starts a fresh request; its ready verdict is released.
-        let (tx3, rx3) = chan();
-        q.tick(3, || rx3);
-        tx3.send(Ok(7)).unwrap();
+        // The worker is still running (tx1 alive) across several more ticks:
+        // each goes out null at once and no request is ever started.
+        for n in 3..=8 {
+            let out = q.tick(n, || unreachable!("the first request has not returned"));
+            assert_eq!(out.len(), 1);
+            assert_eq!((out[0].0, out[0].1.is_ok()), (n, false));
+            assert!(q.poll().is_empty());
+        }
+        // It finally returns: its late verdict belongs to no event any more.
+        tx1.send(Ok(1)).unwrap();
+        assert!(q.poll().is_empty());
+        assert!(q.inflight.is_none());
+        // Only now may the next tick start a fresh request.
+        let (tx9, rx9) = chan();
+        assert!(q.tick(9, || rx9).is_empty());
+        tx9.send(Ok(7)).unwrap();
         let out = q.poll();
         assert_eq!(out.len(), 1);
-        assert_eq!((out[0].0, out[0].1.clone()), (3, Ok(7)));
+        assert_eq!((out[0].0, out[0].1.clone()), (9, Ok(7)));
+    }
+
+    #[test]
+    fn a_stale_worker_that_dies_frees_the_slot() {
+        let mut q = Q::default();
+        let (tx1, rx1) = chan();
+        q.tick(1, || rx1);
+        q.tick(2, || unreachable!());
+        drop(tx1);
+        let (_tx3, rx3) = chan();
+        // Tick 3 retires the dead worker (nothing awaits it) and starts anew.
+        assert!(q.tick(3, || rx3).is_empty());
+        assert_eq!(q.inflight.as_ref().and_then(|p| p.1), Some(3));
     }
 
     #[test]
@@ -1487,7 +1538,7 @@ mod tests {
         let out = q.tick(2, || rx2);
         assert_eq!(out.len(), 1);
         assert_eq!((out[0].0, out[0].1.clone()), (1, Ok(5)));
-        assert_eq!(q.pending.as_ref().map(|p| p.1), Some(2));
+        assert_eq!(q.inflight.as_ref().and_then(|p| p.1), Some(2));
     }
 
     #[test]

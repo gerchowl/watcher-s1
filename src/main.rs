@@ -99,7 +99,7 @@ fn main() {
         heartbeat: w.heartbeat,
         heartbeat_s1: w.heartbeat_s1,
         evidence_bytes: w.evidence_bytes,
-        sink,
+        sink: Arc::new(sink),
         quiet: w.quiet,
     };
     match w.log {

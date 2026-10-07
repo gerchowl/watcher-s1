@@ -139,7 +139,7 @@ pub struct WrapArgs {
     /// Emit a `heartbeat` status event every DUR (at least 1s; default off).
     #[arg(long, value_name = "DUR", value_parser = parse_heartbeat)]
     pub heartbeat: Option<Duration>,
-    /// Attach a System One verdict to each heartbeat (one call per interval).
+    /// Attach a System One verdict to each heartbeat (at most one request in flight; the breaker applies).
     #[arg(long, requires = "heartbeat")]
     pub heartbeat_s1: bool,
     /// Bytes of output tail carried in each event.
