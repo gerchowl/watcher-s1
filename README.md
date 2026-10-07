@@ -187,7 +187,13 @@ stderr, interleaved with the child's output under `--pipe`.
 - No System One call by default (tier 2 is event-time only). `--heartbeat-s1`
   makes each heartbeat ask for a verdict, through the same breaker, deadline
   and fail-open path as the silence-time call; it is attached as `s1` and never
-  changes `state`.
+  changes `state`. Liveness comes first: at most one such request is in
+  flight. If it is still pending when the next tick is due, that heartbeat
+  is emitted with `s1: null` and so is the new tick's, with no new request;
+  a worker that died fails open the same way. At exit (or on a signal in
+  `--log` mode) a pending verdict is waited for at most 250 ms, then the
+  heartbeat goes out with `s1: null`, so heartbeats precede the final event
+  but never hold it up.
 - `--log` mode emits heartbeats too.
 
 Heartbeats add `heartbeat` to the `reason` enum within schema 1. They appear
