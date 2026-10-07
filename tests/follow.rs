@@ -461,6 +461,76 @@ fn rotation_is_followed_and_the_old_file_keeps_being_read() {
 }
 
 #[test]
+fn rotation_is_noticed_while_the_old_file_is_still_busy() {
+    let e = Env::new();
+    let p = e.path("e.jsonl");
+    let old = e.path("e.jsonl.1");
+    let producer = Arc::new(Sink::file(p.to_str().unwrap()).unwrap());
+    producer.emit(&live("r1"));
+    let mut c = Follow::start(&["--timeout", "30s", p.to_str().unwrap()]);
+    c.ready();
+    c.wait_lines(1);
+    // The producer never pauses for long: the old inode makes progress at every poll.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let busy = {
+        let (producer, stop) = (producer.clone(), stop.clone());
+        spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                producer.emit(&live("r1"));
+                sleep(Duration::from_millis(2));
+            }
+        })
+    };
+    std::fs::rename(&p, &old).unwrap();
+    // The locked run's verdict lands on the NEW file; the old one only gets noise.
+    append(&p, &line(&done("r1")));
+    let t0 = Instant::now();
+    let (code, out, err) = c.finish();
+    stop.store(true, Ordering::SeqCst);
+    busy.join().unwrap();
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("done exit"), "{out}");
+    assert!(
+        t0.elapsed() < Duration::from_secs(10),
+        "the replacement was starved: {:?}",
+        t0.elapsed()
+    );
+}
+
+#[test]
+fn a_line_over_a_mebibyte_is_skipped_with_one_warning() {
+    let e = Env::new();
+    let p = e.path("e.jsonl");
+    let mut big = String::from("{\"run_id\":\"r\",\"pad\":\"");
+    big.push_str(&"x".repeat(2 * 1024 * 1024));
+    big.push_str("\"}\n");
+    append(&p, &line(&live("r")));
+    append(&p, &big);
+    append(&p, &line(&done("r")));
+    let (code, out, err) = Follow::start(&["--timeout", "20s", p.to_str().unwrap()]).finish();
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(out.lines().count(), 2, "{out}");
+    assert_eq!(err.matches("discarding a line longer than").count(), 1, "{err}");
+    // An endless line with no newline neither grows memory without bound nor hangs the follow.
+    let q = e.path("endless.jsonl");
+    append(&q, &line(&live("r")));
+    {
+        let mut f = OpenOptions::new().append(true).open(&q).unwrap();
+        let chunk = vec![b'y'; 1 << 20];
+        for _ in 0..20 {
+            f.write_all(&chunk).unwrap();
+        }
+    }
+    let mut c = Follow::start(&["--timeout", "20s", q.to_str().unwrap()]);
+    c.ready();
+    c.wait_lines(1);
+    append(&q, &format!("\n{}", line(&done("r"))));
+    let (code, out, err) = c.finish();
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("done exit"), "{out}");
+}
+
+#[test]
 fn new_skips_the_rest_of_a_line_it_lands_in() {
     let e = Env::new();
     let p = e.path("e.jsonl");
