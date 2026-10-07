@@ -6,14 +6,11 @@
   # files. To update: `nix flake update vigos`.
   inputs = {
     # The shared vigOS toolchain (single source of truth).
-    # This scaffold deliberately FLOATS on the default branch so a fresh
-    # project works before its first pin. Once you depend on stability
-    # (especially the vigos.* home-manager module options), pin a release
-    # tag instead and bump deliberately:
-    #   vigos.url = "github:vig-os/devkit?ref=<tag>";
-    # Policy: https://github.com/vig-os/devkit/blob/main/docs/NIX.md
-    # "Home-manager modules - versioning & release policy".
-    vigos.url = "github:vig-os/devkit";
+    # Pinned to a devkit release tag (policy: https://github.com/vig-os/devkit/blob/main/docs/NIX.md,
+    # "Home-manager modules - versioning & release policy"). The pin must match
+    # DEVKIT_VERSION in .vig-os; with DEVKIT_FLAKE_PIN_ADVANCE=true, devkit
+    # upgrades (`install.sh --force`) advance it together with flake.lock.
+    vigos.url = "github:vig-os/devkit?ref=1.18.0";
     # Follow vigos's pinned nixpkgs + flake-utils so your tools match the
     # toolchain exactly (one resolved nixpkgs, no drift).
     nixpkgs.follows = "vigos/nixpkgs";
