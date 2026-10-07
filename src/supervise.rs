@@ -350,8 +350,8 @@ struct Watch<'a> {
     next_heartbeat: Option<Instant>,
     hb_bytes: u64,
     hb_lines: u64,
-    /// Heartbeats still waiting for their System One verdict.
-    pending_heartbeats: Vec<(Receiver<Result<Verdict, String>>, Event)>,
+    /// The heartbeat awaiting its System One verdict (at most one).
+    pending_heartbeats: HbQueue<Event, Verdict>,
     timeout_fired: bool,
     kill_at: Option<Instant>,
     prompt_since: Option<Instant>,
@@ -382,7 +382,7 @@ impl<'a> Watch<'a> {
             next_heartbeat: opts.heartbeat.map(|d| later(now, d)),
             hb_bytes: 0,
             hb_lines: 0,
-            pending_heartbeats: Vec::new(),
+            pending_heartbeats: HbQueue::default(),
             timeout_fired: false,
             kill_at: None,
             prompt_since: None,
@@ -476,25 +476,26 @@ impl<'a> Watch<'a> {
     }
 
     /// Emit a heartbeat when its tick is due; release verdicts that arrived.
+    /// Liveness comes first: a verdict never delays a heartbeat (see `HbQueue`).
     fn heartbeat(&mut self, now: Instant) {
+        let mut out = Vec::new();
         if let (Some(every), Some(at)) = (self.opts.heartbeat, self.next_heartbeat)
             && now >= at
         {
             self.next_heartbeat = Some(next_tick(self.start, every, now));
             let ev = self.heartbeat_event(now);
-            match self.opts.s1.as_ref().filter(|_| self.opts.heartbeat_s1) {
+            match self.opts.s1.clone().filter(|_| self.opts.heartbeat_s1) {
                 Some(client) => {
-                    let rx = self.judge_async(client);
-                    self.pending_heartbeats.push((rx, ev));
+                    let mut q = std::mem::take(&mut self.pending_heartbeats);
+                    out = q.tick(ev, || self.judge_async(&client));
+                    self.pending_heartbeats = q;
                 }
                 None => self.opts.sink.emit(&ev),
             }
+        } else {
+            out = self.pending_heartbeats.poll();
         }
-        // Oldest first, so the order of the heartbeats is kept.
-        while let Some((rx, _)) = self.pending_heartbeats.first()
-            && let Ok(res) = rx.try_recv()
-        {
-            let (_, ev) = self.pending_heartbeats.remove(0);
+        for (ev, res) in out {
             self.emit_heartbeat(ev, res);
         }
     }
@@ -508,14 +509,11 @@ impl<'a> Watch<'a> {
         self.opts.sink.emit(&ev);
     }
 
-    /// Before the final event: wait out the heartbeats still being judged
-    /// (bounded by the System One budget), so they precede it.
+    /// Before the final event (or on a signal exit): release the pending
+    /// heartbeat, waiting at most `HB_FLUSH_BOUND` for its verdict, else
+    /// failing open. Never blocks the final event for a System One budget.
     fn flush_heartbeats(&mut self) {
-        let Some(client) = &self.opts.s1 else { return };
-        let deadline = later(Instant::now(), s1_budget(client));
-        for (rx, ev) in std::mem::take(&mut self.pending_heartbeats) {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let res = rx.recv_timeout(left).unwrap_or_else(|_| Err("timed out".into()));
+        for (ev, res) in self.pending_heartbeats.flush(HB_FLUSH_BOUND) {
             self.emit_heartbeat(ev, res);
         }
     }
@@ -1270,6 +1268,8 @@ pub fn run_log(opts: Options, path: &std::path::Path) -> Outcome {
                     libc::SIGINT | libc::SIGTERM | libc::SIGHUP | libc::SIGQUIT
                 )
             {
+                // Pending heartbeats are emitted fail-open, not dropped.
+                w.flush_heartbeats();
                 return Outcome::Signal(s as libc::c_int);
             }
         }
@@ -1377,9 +1377,153 @@ pub fn exit_like(outcome: Outcome) -> ! {
     }
 }
 
+/// How long the final event (or a signal exit) waits for a heartbeat verdict.
+const HB_FLUSH_BOUND: Duration = Duration::from_millis(250);
+
+/// Heartbeats waiting for their System One verdict. Liveness beats verdicts:
+///  - at most ONE System One request is in flight for heartbeats;
+///  - if it is still pending when the next tick is due, it is emitted with
+///    `s1: null` (fail-open) and that tick's heartbeat goes out at once with
+///    `s1: null` and no new request, so a slow endpoint never delays or
+///    queues up heartbeats;
+///  - a ready verdict is released as soon as it is seen; a worker that died
+///    (channel disconnected) is released fail-open, never waited for.
+struct HbQueue<E, V> {
+    pending: Option<(Receiver<Result<V, String>>, E)>,
+}
+
+impl<E, V> Default for HbQueue<E, V> {
+    fn default() -> Self {
+        Self { pending: None }
+    }
+}
+
+type Released<E, V> = Vec<(E, Result<V, String>)>;
+
+impl<E, V> HbQueue<E, V> {
+    /// Release the pending entry if its verdict is ready or its worker died.
+    fn poll(&mut self) -> Released<E, V> {
+        let Some((rx, _)) = &self.pending else {
+            return Vec::new();
+        };
+        let res = match rx.try_recv() {
+            Ok(r) => r,
+            Err(mpsc::TryRecvError::Empty) => return Vec::new(),
+            Err(mpsc::TryRecvError::Disconnected) => Err("judge worker died".into()),
+        };
+        let (_, ev) = self.pending.take().unwrap();
+        vec![(ev, res)]
+    }
+
+    /// A tick is due with heartbeat `ev`: returns what to emit now, in order.
+    /// `spawn` starts the System One request, only if none is in flight.
+    fn tick(&mut self, ev: E, spawn: impl FnOnce() -> Receiver<Result<V, String>>) -> Released<E, V> {
+        let mut out = self.poll();
+        if let Some((_, old)) = self.pending.take() {
+            out.push((old, Err("verdict not ready by the next tick".into())));
+            out.push((ev, Err("previous request still in flight".into())));
+        } else {
+            self.pending = Some((spawn(), ev));
+        }
+        out
+    }
+
+    /// Release everything, waiting at most `bound` in total, else fail open.
+    fn flush(&mut self, bound: Duration) -> Released<E, V> {
+        let Some((rx, ev)) = self.pending.take() else {
+            return Vec::new();
+        };
+        let res = match rx.recv_timeout(bound) {
+            Ok(r) => r,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err("timed out".into()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err("judge worker died".into()),
+        };
+        vec![(ev, res)]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type Q = HbQueue<u32, u32>;
+    type Chan = (mpsc::Sender<Result<u32, String>>, Receiver<Result<u32, String>>);
+
+    fn chan() -> Chan {
+        mpsc::channel()
+    }
+
+    #[test]
+    fn a_slow_head_never_delays_the_next_heartbeat() {
+        let mut q = Q::default();
+        let (tx1, rx1) = chan();
+        assert!(q.tick(1, || rx1).is_empty(), "held for its verdict");
+        assert!(q.poll().is_empty(), "not ready: still held");
+        // Next tick, verdict still missing: head out null, tick 2 out at once,
+        // no new request (the closure must not run).
+        let out = q.tick(2, || unreachable!("one request in flight at most"));
+        assert_eq!(
+            out.iter().map(|(e, r)| (*e, r.is_ok())).collect::<Vec<_>>(),
+            [(1, false), (2, false)]
+        );
+        assert!(q.pending.is_none());
+        drop(tx1);
+        // The tick after starts a fresh request; its ready verdict is released.
+        let (tx3, rx3) = chan();
+        q.tick(3, || rx3);
+        tx3.send(Ok(7)).unwrap();
+        let out = q.poll();
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].0, out[0].1.clone()), (3, Ok(7)));
+    }
+
+    #[test]
+    fn a_ready_head_is_released_on_the_next_tick_which_starts_a_new_request() {
+        let mut q = Q::default();
+        let (tx1, rx1) = chan();
+        q.tick(1, || rx1);
+        tx1.send(Ok(5)).unwrap();
+        let (_tx2, rx2) = chan();
+        let out = q.tick(2, || rx2);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].0, out[0].1.clone()), (1, Ok(5)));
+        assert_eq!(q.pending.as_ref().map(|p| p.1), Some(2));
+    }
+
+    #[test]
+    fn a_disconnected_worker_fails_open_without_blocking() {
+        let mut q = Q::default();
+        let (tx, rx) = chan();
+        q.tick(1, || rx);
+        drop(tx); // the worker panicked
+        let out = q.poll();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].1.is_err());
+
+        let (tx, rx) = chan();
+        q.tick(2, || rx);
+        drop(tx);
+        let t = Instant::now();
+        let out = q.flush(Duration::from_secs(5));
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "disconnect must not wait out the bound"
+        );
+        assert_eq!(out.len(), 1);
+        assert!(out[0].1.is_err());
+    }
+
+    #[test]
+    fn flush_is_bounded_for_a_slow_worker() {
+        let mut q = Q::default();
+        let (_tx, rx) = chan();
+        q.tick(1, || rx);
+        let t = Instant::now();
+        let out = q.flush(Duration::from_millis(50));
+        assert!(t.elapsed() < Duration::from_secs(1));
+        assert!(out[0].1.is_err());
+        assert!(q.flush(Duration::from_secs(5)).is_empty());
+    }
 
     #[test]
     fn heartbeat_ticks_stay_on_the_grid_and_never_burst() {
