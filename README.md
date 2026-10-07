@@ -97,6 +97,8 @@ Without Nix:
 watcher-s1 [OPTIONS] -- CMD [ARGS...]
 watcher-s1 config [--s1-url URL] [--s1-timeout SECS] [--config FILE]
 watcher-s1 judge --posttooluse [--s1-url URL] ...   # Claude Code hook, see below
+watcher-s1 follow [--new] EVENTS_FILE               # stream events until the run ends
+watcher-s1 guide                                    # print the agent guide
 ```
 
 | Option | Default | Meaning |
@@ -291,6 +293,9 @@ Re-run [`eval/`](eval) before changing any wording: a reworded question
 answers differently.
 
 ## Claude Code
+
+Agents: `watcher-s1 guide` prints a short how-to ([docs/agent-guide.md](docs/agent-guide.md)),
+and `watcher-s1 follow EVENTS_FILE` streams the events of a backgrounded run.
 
 Run long commands under the watcher with `run_in_background: true`. The Bash
 call returns immediately, and the agent is woken when the command **exits**,
