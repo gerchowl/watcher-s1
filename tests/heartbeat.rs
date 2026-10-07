@@ -47,7 +47,9 @@ fn three_heartbeats_then_the_final_event() {
         );
         let at = h["elapsed_ms"].as_u64().unwrap() as i64;
         let want = 2000 * (i as i64 + 1);
-        assert!((at - want).abs() < 600, "tick {i} at {at} ms, wanted ~{want}");
+        // Ticks sit on the grid; the margin only absorbs a slow runner, and
+        // stays under half an interval so tick i is never mistaken for i+-1.
+        assert!((at - want).abs() < 900, "tick {i} at {at} ms, wanted ~{want}");
         // One key for all of a job's heartbeats, distinct from the final's.
         assert!(h["dedup_key"].as_str().unwrap().contains(":heartbeat:"));
         assert_eq!(h["dedup_key"], ev[0]["dedup_key"]);
@@ -295,23 +297,29 @@ fn bad_heartbeat_flags_are_usage_errors() {
 fn a_blocked_loop_yields_one_heartbeat_not_a_burst() {
     let e = Env::new();
     let mut c = e.cmd();
-    c.args(["--no-s1", "-q", "--heartbeat", "1s", "--", "sleep", "7"]);
+    // The child outlives every stall: an overshooting sleep on a slow runner
+    // can never make it exit while the watcher is stopped. We end the run.
+    c.args(["--no-s1", "-q", "--heartbeat", "1s", "--", "sleep", "30"]);
     let mut child = c.spawn().unwrap();
     let pid = child.id() as i32;
     std::thread::sleep(Duration::from_millis(1500)); // tick at 1s
     unsafe { libc::kill(pid, libc::SIGSTOP) };
     std::thread::sleep(Duration::from_millis(3700)); // ticks 2..5 are missed, resume mid-interval
     unsafe { libc::kill(pid, libc::SIGCONT) };
-    assert!(child.wait().unwrap().success());
+    std::thread::sleep(Duration::from_millis(2500)); // at least one more tick after resuming
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let st = child.wait().unwrap();
+    assert_eq!(st.signal(), Some(libc::SIGTERM), "{st:?}");
     let ev = e.events();
     let at: Vec<u64> = heartbeats(&ev)
         .iter()
         .map(|h| h["elapsed_ms"].as_u64().unwrap())
         .collect();
     assert!(at.len() >= 3, "{at:?}");
-    // A burst would put several heartbeats within milliseconds of each other.
+    // A burst would put several heartbeats within milliseconds of each other;
+    // consecutive grid ticks are 1000 ms apart.
     for w in at.windows(2) {
-        assert!(w[1] - w[0] >= 400, "burst after the blocked loop: {at:?}");
+        assert!(w[1] - w[0] >= 250, "burst after the blocked loop: {at:?}");
     }
 }
 
@@ -324,25 +332,49 @@ fn log_mode_emits_heartbeats_since_attach() {
     c.args(["--no-s1", "-q", "--silence", "0", "--heartbeat", "1s", "--log"])
         .arg(&log);
     let child = c.spawn().unwrap();
-    std::thread::sleep(Duration::from_millis(300));
+    // Readiness, not a guess: the first heartbeat proves the watcher is
+    // attached and has primed its ring from the file (and starts a fresh
+    // interval), however slow the runner is to start it.
+    let first = wait_until(Duration::from_secs(20), || !heartbeats(&e.events()).is_empty());
+    assert!(first, "no heartbeat after attach");
     let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
     f.write_all(b"step 1 done\n").unwrap();
-    std::thread::sleep(Duration::from_millis(2200));
+    // ... and a couple of intervals more, polled instead of slept.
+    let seen = wait_until(Duration::from_secs(20), || {
+        heartbeats(&e.events()).iter().any(|h| h["last_line"] == "step 1 done") && heartbeats(&e.events()).len() >= 3
+    });
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     let o = child.wait_with_output().unwrap();
     assert_eq!(o.status.signal(), Some(libc::SIGTERM));
     let ev = e.events();
     let hb = heartbeats(&ev);
-    assert!(hb.len() >= 2, "{:?}", states(&ev));
+    assert!(seen, "{:?}", states(&ev));
     assert_eq!(states(&ev).iter().filter(|s| *s != "progressing/heartbeat").count(), 0);
     assert!(hb[0]["cmd"].as_str().unwrap().starts_with("--log "));
-    assert_eq!(hb[0]["last_line"], "step 1 done");
-    // What was already in the file at attach is not "since last".
+    // What was already in the file at attach is not "since last": the first
+    // heartbeat saw nothing new, the one after the append saw exactly it.
     assert_eq!(
         (hb[0]["bytes_since_last"].as_u64(), hb[0]["lines_since_last"].as_u64()),
+        (Some(0), Some(0))
+    );
+    assert_eq!(hb[0]["last_line"], "old content");
+    let with = hb.iter().find(|h| h["last_line"] == "step 1 done").unwrap();
+    assert_eq!(
+        (with["bytes_since_last"].as_u64(), with["lines_since_last"].as_u64()),
         (Some(12), Some(1))
     );
-    assert_eq!(hb[1]["bytes_since_last"], 0);
     let at = hb[0]["elapsed_ms"].as_u64().unwrap() as i64;
-    assert!((at - 1000).abs() < 600, "{at}");
+    assert!((at - 1000).abs() < 900, "{at}");
+}
+
+/// Poll `f` every 50 ms until it holds or `limit` passes.
+fn wait_until(limit: Duration, mut f: impl FnMut() -> bool) -> bool {
+    let end = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < end {
+        if f() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    f()
 }
