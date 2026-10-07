@@ -12,7 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--heartbeat DUR` (minimum `1s`) emits periodic `reason: heartbeat` status events (current episode state, severity `info`, `elapsed_ms`, `bytes_since_last`, `lines_since_last`, `last_line`) on a monotonic schedule, in `--log` mode too; `--heartbeat-s1` attaches a System One verdict to each; schema stays 1 with `heartbeat` added to the `reason` enum ([#18](https://github.com/gerchowl/watcher-s1/issues/18))
 - `watcher-s1 guide` prints an agent-sized usage guide (`docs/agent-guide.md`), and
   `watcher-s1 follow EVENTS_FILE` streams an events file as compact lines until
-  the run it locked onto finishes; a test keeps the guide and README in step
+  the run it locked onto finishes (`--timeout DUR` gives up with exit 3; it
+  survives truncation and rotation of the file); a test keeps the guide and README in step
   with the CLI flags and the event schema ([#19](https://github.com/gerchowl/watcher-s1/issues/19))
 
 ### Changed
