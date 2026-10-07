@@ -43,8 +43,10 @@ verdict.
 - `follow` locks onto the first run it sees and indents nested watchers. Once
   locked, other runs' final events cannot end it (a quiet outer watcher that
   has emitted nothing yet means the first run seen may be an inner one). It
-  copes with the file being truncated or replaced (rotated: the new file is
-  read from the start, the old one is still read for late writes). A file
+  copes with the file being truncated or replaced (rotated: the pathname is
+  checked every 500 ms, the new file is read from the start, and the old one
+  is still read for late writes; at most the 16 most recent old files are kept,
+  older ones are dropped). A line longer than 1 MiB is skipped with a warning. A file
   reused in place is only noticed when its first 64 bytes change or it
   shrinks, so use a fresh file per run.
 - `follow` reads regular files only (a FIFO is refused with exit 2). If its
@@ -103,8 +105,14 @@ timeout?, heartbeat?}` runs the job detached (it outlives the session) and
 returns an `id`. `watch_wait {id, until: "final", timeout_s}` blocks until the
 verdict (check `timed_out`, wait again if set); `until: "next"` returns events
 you have not seen. `watch_status {id}`, `watch_list` and `watch_stop {id}`
-cover the rest: stop sends TERM, then SIGKILL to the job's group after
-`grace_s` (default 5). Events and reactions are the same as below, and a new
+cover the rest: stop has the supervisor send TERM to the job's whole group,
+then SIGKILL after `grace_s` (default 5) and before it reaps the leader, so
+stubborn descendants die too (final `reason: stopped`). `watch_wait` returns at
+most 100 events (`more: true` when there are more) and delivers each event once
+per run, except that the final verdict repeats with `already_seen`; a response
+lost in transit loses its events for you, so check `watch_status` and the
+`events_path` file when in doubt. `output.log` grows without bound unless you
+pass `timeout`. Events and reactions are the same as below, and a new
 session can `watch_wait` on a run an earlier one started. With `--channel`,
 edge events arrive on their own as `<channel>` messages carrying the same
 `id` as `run_id`.
