@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Event delivery no longer runs on the supervisor loop: a writer thread with a bounded queue keeps `--timeout`, signal forwarding and heartbeats responsive when the event sink (`--events-fd` pipe, stderr) is not read; heartbeats are shed under overload and report `heartbeats_dropped`, other events keep order via a bounded overflow queue. The final event may still block at exit on a sink nobody reads.
 - `--heartbeat-s1` keeps at most one System One request in flight: after an overdue verdict, later heartbeats go out with `s1: null` and no new request starts until the slow one returns.
+- No supervisor diagnostic or event write can block the loop any more: every `watcher-s1 (log):` line (and the overflow warning) goes through a bounded, nonblocking channel to one stderr writer thread shared with the stderr event sink (a full queue drops and counts), and a timeout sends TERM before it logs, so a stderr nobody reads no longer freezes `--timeout` ([#26](https://github.com/gerchowl/watcher-s1/issues/26))
+- A heartbeat still waiting for its System One verdict is released fail-open before any later event is enqueued, so events never appear out of creation order (a stale `stalled` heartbeat after `resumed`) ([#26](https://github.com/gerchowl/watcher-s1/issues/26))
+- The crate version is 0.2.0 (the binary and the MCP server reported 0.1.0), and the binary release workflow fails if `--version` differs from the tag ([#26](https://github.com/gerchowl/watcher-s1/issues/26))
 - Heartbeat `last_line` is the true last non-empty output line (200 chars, ANSI stripped), tracked incrementally instead of read back from the 16 KiB evidence ring.
 
 ### Security

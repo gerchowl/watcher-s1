@@ -71,11 +71,7 @@ impl Outcome {
     }
 }
 
-pub fn log(quiet: bool, msg: &str) {
-    if !quiet {
-        let _ = writeln!(std::io::stderr(), "watcher-s1 (log): {msg}");
-    }
-}
+pub use crate::diag::log;
 
 // ---------------------------------------------------------------------------
 // Signals: handlers only write the signal number to a self-pipe; the poll
@@ -409,7 +405,19 @@ impl<'a> Watch<'a> {
         if ev.severity >= Severity::Warn {
             self.episode_warned = true;
         }
-        self.out.send(ev.clone());
+        self.enqueue(ev.clone());
+    }
+
+    /// The only way a non-heartbeat event reaches the outbox. A heartbeat
+    /// still awaiting its System One verdict was created earlier, so it is
+    /// released first (fail-open if the verdict is not in): the file order
+    /// is always the creation order, and a stale `stalled` heartbeat can
+    /// never land after the `resumed` that superseded it.
+    fn enqueue(&mut self, ev: Event) {
+        for (hb, res) in self.pending_heartbeats.release() {
+            self.emit_heartbeat(hb, res);
+        }
+        self.out.send(ev);
     }
 
     /// Take in bytes that were already there (log attach): they count for
@@ -429,7 +437,7 @@ impl<'a> Watch<'a> {
             let ev = self
                 .run
                 .event(State::Progressing, Severity::Info, "resumed", self.evidence());
-            self.out.send(ev);
+            self.enqueue(ev);
         }
         self.episode_warned = false;
         self.stall_done = false;
@@ -563,6 +571,7 @@ impl<'a> Watch<'a> {
             && now.duration_since(since) >= after
         {
             self.cancel_fired = true;
+            let _ = kill(Pid::from_raw(-self.run.pgid), Signal::SIGINT);
             log(
                 self.opts.quiet,
                 &format!(
@@ -570,7 +579,6 @@ impl<'a> Watch<'a> {
                     self.run.pgid
                 ),
             );
-            let _ = kill(Pid::from_raw(-self.run.pgid), Signal::SIGINT);
             self.term_at = Some(later(now, self.opts.kill_grace));
         }
 
@@ -682,33 +690,33 @@ impl<'a> Watch<'a> {
             && now.duration_since(self.start) >= limit
         {
             self.timeout_fired = true;
+            let _ = kill(Pid::from_raw(-self.run.pgid), Signal::SIGTERM);
             log(
                 self.opts.quiet,
                 &format!("timeout after {:?}: SIGTERM to process group {}", limit, self.run.pgid),
             );
-            let _ = kill(Pid::from_raw(-self.run.pgid), Signal::SIGTERM);
             self.kill_at = Some(later(now, self.opts.kill_grace));
         }
         if let Some(at) = self.term_at
             && now >= at
         {
             self.term_at = None;
+            let _ = kill(Pid::from_raw(-self.run.pgid), Signal::SIGTERM);
             log(
                 self.opts.quiet,
                 &format!("still running: SIGTERM to process group {}", self.run.pgid),
             );
-            let _ = kill(Pid::from_raw(-self.run.pgid), Signal::SIGTERM);
             self.kill_at = Some(later(now, self.opts.kill_grace));
         }
         if let Some(at) = self.kill_at
             && now >= at
         {
             self.kill_at = None;
+            let _ = kill(Pid::from_raw(-self.run.pgid), Signal::SIGKILL);
             log(
                 self.opts.quiet,
                 &format!("grace expired: SIGKILL to process group {}", self.run.pgid),
             );
-            let _ = kill(Pid::from_raw(-self.run.pgid), Signal::SIGKILL);
         }
     }
 }
@@ -962,11 +970,7 @@ pub fn run(opts: Options) -> Outcome {
             } else {
                 126
             };
-            let _ = writeln!(
-                std::io::stderr(),
-                "watcher-s1 (error): cannot run {}: {e}",
-                opts.argv[0]
-            );
+            crate::diag::error(&format!("cannot run {}: {e}", opts.argv[0]));
             let mut ev = run.event(State::Failing, Severity::Error, "exit", format!("cannot run: {e}"));
             ev.exit = Some(Outcome::Code(code).exit());
             opts.sink.emit(&ev);
@@ -1368,6 +1372,8 @@ fn final_event(w: &Watch<'_>, outcome: Outcome) -> Event {
 /// Leave the way the child left: same exit code, or the same signal
 /// re-raised with the default action (so callers see 128+n).
 pub fn exit_like(outcome: Outcome) -> ! {
+    // Everything queued for stderr (diagnostics, events on the stderr sink).
+    crate::diag::drain();
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
     match outcome {
@@ -1440,6 +1446,19 @@ impl<E, V> HbQueue<E, V> {
         }
     }
 
+    /// A later event is about to be enqueued: release the awaiting heartbeat
+    /// now (its verdict if ready, else fail-open), so it goes out first. The
+    /// worker stays registered: it still counts as the one request in flight.
+    fn release(&mut self) -> Released<E, V> {
+        let mut out = self.poll();
+        if let Some((_, awaiting)) = &mut self.inflight
+            && let Some(ev) = awaiting.take()
+        {
+            out.push((ev, Err("superseded by a later event".into())));
+        }
+        out
+    }
+
     /// A tick is due with heartbeat `ev`: returns what to emit now, in order.
     /// `spawn` starts the System One request, only if none is in flight.
     fn tick(&mut self, ev: E, spawn: impl FnOnce() -> Receiver<Result<V, String>>) -> Released<E, V> {
@@ -1480,6 +1499,36 @@ mod tests {
 
     fn chan() -> Chan {
         mpsc::channel()
+    }
+
+    #[test]
+    fn a_later_event_releases_the_awaiting_heartbeat_first() {
+        // silence -> resumed with a delayed verdict: the heartbeat (created
+        // before `resumed`) must leave the queue before `resumed` is enqueued.
+        let mut q = Q::default();
+        let (tx, rx) = chan();
+        assert!(q.tick(1, || rx).is_empty(), "held for its verdict");
+        let out = q.release();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, 1);
+        assert!(out[0].1.is_err(), "fail-open: no verdict yet");
+        assert!(q.release().is_empty(), "nothing left to release");
+        // The request is still in flight: the next tick must not spawn another.
+        let out = q.tick(2, || panic!("no second request while one is in flight"));
+        assert_eq!(out.len(), 1);
+        assert!(out[0].1.is_err());
+        // The late verdict for the released heartbeat is discarded.
+        tx.send(Ok(7)).unwrap();
+        assert!(q.poll().is_empty());
+    }
+
+    #[test]
+    fn a_ready_verdict_is_attached_when_released_by_a_later_event() {
+        let mut q = Q::default();
+        let (tx, rx) = chan();
+        assert!(q.tick(1, || rx).is_empty());
+        tx.send(Ok(5)).unwrap();
+        assert_eq!(q.release(), vec![(1, Ok(5))]);
     }
 
     #[test]

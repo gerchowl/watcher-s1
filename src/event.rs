@@ -266,7 +266,7 @@ impl Sink {
         match self {
             Sink::Stderr => {
                 let line = format!("{STDERR_PREFIX}{json}\n");
-                let _ = std::io::stderr().lock().write_all(line.as_bytes());
+                crate::diag::line(line);
             }
             Sink::Writer(f) => {
                 let line = format!("{json}\n");
