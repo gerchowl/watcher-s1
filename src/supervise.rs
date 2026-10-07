@@ -2,6 +2,7 @@
 //! default), tee its output through unchanged, watch it (tiers 0–2), emit
 //! sideband events, and report its exit truthfully.
 
+use crate::control::{ControlServer, StatusReply};
 use crate::detect;
 use crate::event::{BlockedProc, ENV_PARENT, Event, Exit, Heartbeat, ProcInfo, RunInfo, Severity, Sink, State};
 use crate::outbox::Outbox;
@@ -44,6 +45,8 @@ pub struct Options {
     /// Attach a System One verdict to each heartbeat.
     pub heartbeat_s1: bool,
     pub evidence_bytes: usize,
+    /// Serve status and stop requests on this Unix socket (see `control`).
+    pub control: Option<std::path::PathBuf>,
     pub s1: Option<Arc<Client>>,
     pub sink: Arc<Sink>,
     pub quiet: bool,
@@ -71,11 +74,7 @@ impl Outcome {
     }
 }
 
-pub fn log(quiet: bool, msg: &str) {
-    if !quiet {
-        let _ = writeln!(std::io::stderr(), "watcher-s1 (log): {msg}");
-    }
-}
+pub use crate::diag::log;
 
 // ---------------------------------------------------------------------------
 // Signals: handlers only write the signal number to a self-pipe; the poll
@@ -359,6 +358,8 @@ struct Watch<'a> {
     kill_at: Option<Instant>,
     prompt_since: Option<Instant>,
     cancel_fired: bool,
+    /// A control-socket `stop` made us TERM (then KILL) the group.
+    stop_fired: bool,
     term_at: Option<Instant>,
 }
 
@@ -392,13 +393,45 @@ impl<'a> Watch<'a> {
             kill_at: None,
             prompt_since: None,
             cancel_fired: false,
+            stop_fired: false,
             term_at: None,
         }
     }
 
-    /// Did we (timeout or prompt cancel) kill the group?
+    /// Did we (timeout, prompt cancel or a control-socket stop) kill the group?
     fn we_killed(&self) -> bool {
-        self.timeout_fired || self.cancel_fired
+        self.timeout_fired || self.cancel_fired || self.stop_fired
+    }
+
+    /// The answer to a control-socket `status`.
+    fn control_status(&self, pid: Option<i32>) -> StatusReply {
+        let state = serde_json::to_value(self.episode_state())
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        StatusReply {
+            pid,
+            pgid: pid,
+            state: match state.as_str() {
+                "stalled" => "stalled",
+                "waiting_on_input" => "waiting_on_input",
+                _ => "progressing",
+            },
+            elapsed_ms: self.start.elapsed().as_millis() as u64,
+        }
+    }
+
+    /// A control-socket `stop`: the `--timeout` escalation with the caller's
+    /// grace (TERM now, KILL after it, and KILL again before the leader is
+    /// reaped), ending with `reason: stopped`. A run already being killed
+    /// keeps its own schedule.
+    fn request_stop(&mut self, now: Instant, grace: Duration) {
+        if self.we_killed() {
+            return;
+        }
+        self.stop_fired = true;
+        let _ = kill(Pid::from_raw(-self.run.pgid), Signal::SIGTERM);
+        self.kill_at = Some(later(now, grace));
     }
 
     fn evidence(&self) -> String {
@@ -409,7 +442,19 @@ impl<'a> Watch<'a> {
         if ev.severity >= Severity::Warn {
             self.episode_warned = true;
         }
-        self.out.send(ev.clone());
+        self.enqueue(ev.clone());
+    }
+
+    /// The only way a non-heartbeat event reaches the outbox. A heartbeat
+    /// still awaiting its System One verdict was created earlier, so it is
+    /// released first (fail-open if the verdict is not in): the file order
+    /// is always the creation order, and a stale `stalled` heartbeat can
+    /// never land after the `resumed` that superseded it.
+    fn enqueue(&mut self, ev: Event) {
+        for (hb, res) in self.pending_heartbeats.release() {
+            self.emit_heartbeat(hb, res);
+        }
+        self.out.send(ev);
     }
 
     /// Take in bytes that were already there (log attach): they count for
@@ -429,7 +474,7 @@ impl<'a> Watch<'a> {
             let ev = self
                 .run
                 .event(State::Progressing, Severity::Info, "resumed", self.evidence());
-            self.out.send(ev);
+            self.enqueue(ev);
         }
         self.episode_warned = false;
         self.stall_done = false;
@@ -563,6 +608,7 @@ impl<'a> Watch<'a> {
             && now.duration_since(since) >= after
         {
             self.cancel_fired = true;
+            let _ = kill(Pid::from_raw(-self.run.pgid), Signal::SIGINT);
             log(
                 self.opts.quiet,
                 &format!(
@@ -570,7 +616,6 @@ impl<'a> Watch<'a> {
                     self.run.pgid
                 ),
             );
-            let _ = kill(Pid::from_raw(-self.run.pgid), Signal::SIGINT);
             self.term_at = Some(later(now, self.opts.kill_grace));
         }
 
@@ -682,33 +727,33 @@ impl<'a> Watch<'a> {
             && now.duration_since(self.start) >= limit
         {
             self.timeout_fired = true;
+            let _ = kill(Pid::from_raw(-self.run.pgid), Signal::SIGTERM);
             log(
                 self.opts.quiet,
                 &format!("timeout after {:?}: SIGTERM to process group {}", limit, self.run.pgid),
             );
-            let _ = kill(Pid::from_raw(-self.run.pgid), Signal::SIGTERM);
             self.kill_at = Some(later(now, self.opts.kill_grace));
         }
         if let Some(at) = self.term_at
             && now >= at
         {
             self.term_at = None;
+            let _ = kill(Pid::from_raw(-self.run.pgid), Signal::SIGTERM);
             log(
                 self.opts.quiet,
                 &format!("still running: SIGTERM to process group {}", self.run.pgid),
             );
-            let _ = kill(Pid::from_raw(-self.run.pgid), Signal::SIGTERM);
             self.kill_at = Some(later(now, self.opts.kill_grace));
         }
         if let Some(at) = self.kill_at
             && now >= at
         {
             self.kill_at = None;
+            let _ = kill(Pid::from_raw(-self.run.pgid), Signal::SIGKILL);
             log(
                 self.opts.quiet,
                 &format!("grace expired: SIGKILL to process group {}", self.run.pgid),
             );
-            let _ = kill(Pid::from_raw(-self.run.pgid), Signal::SIGKILL);
         }
     }
 }
@@ -911,6 +956,9 @@ fn write_some(fd: RawFd, data: &[u8]) -> Option<usize> {
     }
 }
 
+/// Reads of one output per loop pass (64 KiB each).
+const MAX_READS_PER_PASS: usize = 16;
+
 /// Read what is available. `None` = EOF/EIO (the writer side is gone).
 fn read_some(fd: RawFd, buf: &mut [u8]) -> Option<usize> {
     loop {
@@ -952,6 +1000,12 @@ pub fn run(opts: Options) -> Outcome {
             return Outcome::Code(125);
         }
     };
+    // Bound before the child exists, so a path we cannot use fails the run
+    // before anything starts.
+    let mut control = match bind_control(&opts) {
+        Ok(c) => c,
+        Err(code) => return Outcome::Code(code),
+    };
     let mut run = make_run_info(&opts.argv, 0);
     let mut sp = match spawn(&opts, &run.run_id, interactive) {
         Ok(s) => s,
@@ -962,11 +1016,7 @@ pub fn run(opts: Options) -> Outcome {
             } else {
                 126
             };
-            let _ = writeln!(
-                std::io::stderr(),
-                "watcher-s1 (error): cannot run {}: {e}",
-                opts.argv[0]
-            );
+            crate::diag::error(&format!("cannot run {}: {e}", opts.argv[0]));
             let mut ev = run.event(State::Failing, Severity::Error, "exit", format!("cannot run: {e}"));
             ev.exit = Some(Outcome::Code(code).exit());
             opts.sink.emit(&ev);
@@ -1056,6 +1106,9 @@ pub fn run(opts: Options) -> Outcome {
             }
             _ => None,
         };
+        if let Some(c) = &control {
+            c.push_pollfds(&mut fds);
+        }
         unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 100) };
         // An output fd the kernel calls invalid would otherwise spin.
         for (i, (fd, _)) in sp.outputs.iter().enumerate() {
@@ -1085,10 +1138,26 @@ pub fn run(opts: Options) -> Outcome {
             }
         }
 
+        // Control socket: status is answered from here, a stop starts the
+        // timeout-style escalation (only while the child is still running).
+        if let Some(c) = control.as_mut()
+            && let Some(grace) = c.service(&|| w.control_status(Some(pid)))
+            && status.is_none()
+        {
+            w.request_stop(Instant::now(), grace);
+        }
+
         // Output: into the ring, and to the writer to tee through unchanged.
         let mut got_output = false;
         'outputs: for (i, (fd, is_err)) in sp.outputs.iter().enumerate() {
-            while open[i] && held.is_none() {
+            // A bounded number of reads per pass, so output that never stops
+            // coming cannot starve the rest of the loop: noticing the leader
+            // exit (which starts the drain cap), the timers, `--timeout` and
+            // the control socket. The poll above returns at once while data
+            // is waiting, so throughput is unaffected.
+            let mut reads = 0;
+            while open[i] && held.is_none() && reads < MAX_READS_PER_PASS {
+                reads += 1;
                 // The drain is bounded even while data keeps coming (a
                 // grandchild writing faster than our reader consumes).
                 if cap.is_some_and(|c| Instant::now() >= c) {
@@ -1239,6 +1308,10 @@ pub fn run_log(opts: Options, path: &std::path::Path) -> Outcome {
             return Outcome::Code(125);
         }
     };
+    let mut control = match bind_control(&opts) {
+        Ok(c) => c,
+        Err(code) => return Outcome::Code(code),
+    };
     let mut run = make_run_info(&[], 0);
     run.cmd = format!("--log {}", path.display());
     run.pgid = 0;
@@ -1266,12 +1339,23 @@ pub fn run_log(opts: Options, path: &std::path::Path) -> Outcome {
     }
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        let mut p = libc::pollfd {
+        let mut fds = vec![libc::pollfd {
             fd: sig_r.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
-        };
-        unsafe { libc::poll(&mut p, 1, 200) };
+        }];
+        if let Some(c) = &control {
+            c.push_pollfds(&mut fds);
+        }
+        unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 200) };
+        // A control `stop` ends passive mode as TERM does: there is no child.
+        if let Some(c) = control.as_mut()
+            && c.service(&|| w.control_status(None)).is_some()
+        {
+            w.flush_heartbeats();
+            w.out.finish(None);
+            return Outcome::Signal(libc::SIGTERM);
+        }
         let mut sb = [0u8; 64];
         while let Some(n) = read_some(sig_r.as_raw_fd(), &mut sb).filter(|n| *n > 0) {
             if let Some(&s) = sb[..n].iter().find(|&&s| FORWARDED.contains(&(s as libc::c_int)))
@@ -1310,6 +1394,20 @@ pub fn run_log(opts: Options, path: &std::path::Path) -> Outcome {
     }
 }
 
+/// Create the `--control` socket if one was asked for; the error is the exit code.
+fn bind_control(opts: &Options) -> Result<Option<ControlServer>, i32> {
+    let Some(path) = &opts.control else { return Ok(None) };
+    ControlServer::bind(path).map(Some).map_err(|e| {
+        // Plain stderr, not `log`: the caller asked for this socket and must hear why it failed.
+        let _ = writeln!(
+            std::io::stderr(),
+            "watcher-s1 (error): cannot create the control socket {}: {e}",
+            path.display()
+        );
+        125
+    })
+}
+
 /// Read `f` to its current end, feeding the watch.
 fn drain_file(f: &mut std::fs::File, offset: &mut u64, w: &mut Watch<'_>, buf: &mut [u8]) {
     use std::io::Read;
@@ -1330,6 +1428,7 @@ fn final_event(w: &Watch<'_>, outcome: Outcome) -> Event {
     let (mut state, mut severity, reason) = match outcome {
         _ if w.timeout_fired => (State::Failing, Severity::Error, "timeout"),
         _ if w.cancel_fired => (State::Failing, Severity::Error, "prompt_cancelled"),
+        _ if w.stop_fired => (State::Failing, Severity::Error, "stopped"),
         Outcome::Code(0) => (State::Done, Severity::Info, "exit"),
         Outcome::Code(_) => (State::Failing, Severity::Error, "exit"),
         Outcome::Signal(_) => (State::Failing, Severity::Error, "signal"),
@@ -1368,6 +1467,8 @@ fn final_event(w: &Watch<'_>, outcome: Outcome) -> Event {
 /// Leave the way the child left: same exit code, or the same signal
 /// re-raised with the default action (so callers see 128+n).
 pub fn exit_like(outcome: Outcome) -> ! {
+    // Everything queued for stderr (diagnostics, events on the stderr sink).
+    crate::diag::drain();
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
     match outcome {
@@ -1440,6 +1541,19 @@ impl<E, V> HbQueue<E, V> {
         }
     }
 
+    /// A later event is about to be enqueued: release the awaiting heartbeat
+    /// now (its verdict if ready, else fail-open), so it goes out first. The
+    /// worker stays registered: it still counts as the one request in flight.
+    fn release(&mut self) -> Released<E, V> {
+        let mut out = self.poll();
+        if let Some((_, awaiting)) = &mut self.inflight
+            && let Some(ev) = awaiting.take()
+        {
+            out.push((ev, Err("superseded by a later event".into())));
+        }
+        out
+    }
+
     /// A tick is due with heartbeat `ev`: returns what to emit now, in order.
     /// `spawn` starts the System One request, only if none is in flight.
     fn tick(&mut self, ev: E, spawn: impl FnOnce() -> Receiver<Result<V, String>>) -> Released<E, V> {
@@ -1480,6 +1594,36 @@ mod tests {
 
     fn chan() -> Chan {
         mpsc::channel()
+    }
+
+    #[test]
+    fn a_later_event_releases_the_awaiting_heartbeat_first() {
+        // silence -> resumed with a delayed verdict: the heartbeat (created
+        // before `resumed`) must leave the queue before `resumed` is enqueued.
+        let mut q = Q::default();
+        let (tx, rx) = chan();
+        assert!(q.tick(1, || rx).is_empty(), "held for its verdict");
+        let out = q.release();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, 1);
+        assert!(out[0].1.is_err(), "fail-open: no verdict yet");
+        assert!(q.release().is_empty(), "nothing left to release");
+        // The request is still in flight: the next tick must not spawn another.
+        let out = q.tick(2, || panic!("no second request while one is in flight"));
+        assert_eq!(out.len(), 1);
+        assert!(out[0].1.is_err());
+        // The late verdict for the released heartbeat is discarded.
+        tx.send(Ok(7)).unwrap();
+        assert!(q.poll().is_empty());
+    }
+
+    #[test]
+    fn a_ready_verdict_is_attached_when_released_by_a_later_event() {
+        let mut q = Q::default();
+        let (tx, rx) = chan();
+        assert!(q.tick(1, || rx).is_empty());
+        tx.send(Ok(5)).unwrap();
+        assert_eq!(q.release(), vec![(1, Ok(5))]);
     }
 
     #[test]

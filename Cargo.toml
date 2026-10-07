@@ -1,6 +1,6 @@
 [package]
 name = "watcher-s1"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Truthful command wrapper that detects stalls, prompts and masked failures"
@@ -17,9 +17,11 @@ clap = { version = "4.6.7", features = ["derive"] }
 libc = "0.2.190"
 nix = { version = "0.31.3", features = ["process", "signal", "term", "poll", "fs", "resource", "hostname", "ioctl"] }
 regex = "1.13.1"
+rmcp = { version = "3.5.1", default-features = false, features = ["server", "transport-io", "macros"], optional = true }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
+tokio = { version = "1.53.2", default-features = false, features = ["rt", "time"], optional = true }
 toml = { version = "1.1.6", features = ["preserve_order"] }
 webpki-roots = "1.0.9"
 
@@ -32,3 +34,10 @@ tempfile = "3.27.0"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[features]
+# `watcher-s1 mcp`, an MCP server over stdio (rmcp, tokio confined to src/mcp).
+# On by default so release binaries and the nix package include it;
+# `--no-default-features` builds the synchronous core alone.
+default = ["mcp"]
+mcp = ["dep:rmcp", "dep:tokio"]
