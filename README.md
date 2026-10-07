@@ -334,21 +334,50 @@ claude mcp add watcher-s1 -- watcher-s1 mcp
 
 | Tool | Does |
 |---|---|
-| `watch_start {cmd, cwd?, silence?, timeout?, heartbeat?, s1?}` | runs `cmd` (an argv array) as a fully wrapped `watcher-s1 --pipe --events ... -- cmd`, detached into its own session so it outlives the server and the session; returns the run `id` and the events and log paths |
-| `watch_wait {id, until, timeout_s?}` | blocks until the next unseen event (`until: "next"`) or the final one (`"final"`), or `timeout_s` (default 60); returns the events as JSON plus the compact `follow` lines. Works for runs an earlier server started |
-| `watch_status {id}` | last event, elapsed time, whether the watcher process is alive (`running`, `finished` or `lost`) |
-| `watch_stop {id, signal?, grace_s?}` | TERM to the watcher (which forwards it to the job's group); if the job is still there after `grace_s` (default 5), SIGKILL to the job's process group; never SIGKILLs the watcher |
+| `watch_start {cmd, cwd?, silence?, timeout?, heartbeat?, s1?}` | runs `cmd` (an argv array) as a fully wrapped `watcher-s1 --pipe --events ... --control ... -- cmd`, detached into its own session so it outlives the server and the session; returns the run `id` and the events and log paths. The run is recorded (`starting`) before anything is launched; if the launch fails it is marked `failed` and nothing runs |
+| `watch_wait {id, until, timeout_s?}` | blocks until the next unseen event (`until: "next"`) or the final one (`"final"`), or `timeout_s` (default 60); returns the events as JSON plus the compact `follow` lines. At most 100 events and 256 KiB per call, with `more: true` when there is more to fetch. Works for runs an earlier server started |
+| `watch_status {id}` | last event, event count, elapsed time, and `state`: `running`, `finished`, `lost` (the watcher is gone and left no final event), `starting` or `failed` |
+| `watch_stop {id, grace_s?}` | asks the run's supervisor to stop the job: TERM to its whole process group, SIGKILL to the group after `grace_s` (default 5) and again just before the leader is reaped, so a descendant that ignores TERM dies even when the leader exits at once. The final event has `reason: stopped` and the job's real signal exit |
 | `watch_list {limit?}` | runs, newest first, with state |
 
 The resource `watcher-s1://guide` is the same text as `watcher-s1 guide`.
 
-Runs live under `--state-dir` (default `$XDG_STATE_HOME/watcher-s1`, else
-`~/.local/state/watcher-s1`), in `runs/<id>/`: `events.jsonl`, `output.log`
-(the job's output only) and `meta.json` (command, cwd, start time, watcher pid,
-options). Runs older than 7 days are pruned when a server starts. The
-directory is the source of truth: a new server sees every run, and
-`watch_wait` remembers per run how many events it has handed out (a `cursor`
-file), so no event is delivered twice.
+Runs live under `--state-dir` (default `$WATCHER_S1_STATE_DIR`, else
+`$XDG_STATE_HOME/watcher-s1`, else `~/.local/state/watcher-s1`), in
+`runs/<id>/`: `events.jsonl`, `output.log` (the job's output only),
+`meta.json` (command, cwd, start time, watcher pid for information, options),
+the read state (`cursor`, `summary`, `cursor.lock`) and the watcher's
+`control.sock`. The directory is the source of truth: a new server sees every
+run.
+
+**Pruning.** Runs older than 7 days whose watcher no longer answers are
+removed when a server starts and then every hour while it runs. A run whose
+watcher is still alive is never pruned, however old. Pruning is the only
+cleanup: **`output.log` is not bounded** while a job runs (nothing caps what
+the job writes), and the 7-day age rule is not a disk quota. Bound a run with
+`timeout`, and stop or prune what you no longer need.
+
+**Control and trust.** The server never signals a process id. Whether a
+watcher is alive, and stopping it, go through its private Unix socket
+(`control.sock`, mode 0600; when the run directory's path is too long for a
+socket path it lives under `$XDG_RUNTIME_DIR/watcher-s1` or
+`/tmp/watcher-s1-<uid>`). The socket is served by the hidden
+`--control PATH` flag of the wrapper; a socket nothing answers on means the
+run is not running. The run id (the directory name) is the only thing paths
+are derived from: a `meta.json` naming another id is refused, paths stored in
+it are ignored, symlinked run directories and state files and non-regular
+files are rejected, and state files are size-bounded. The state directory
+belongs to you; none of this is a defence against the user it belongs to.
+
+**Delivery.** `watch_wait` keeps a per-run cursor (a byte offset into
+`events.jsonl`), updated under a lock that is shared by overlapping calls and
+by every server process using the state directory, so two waiters never get
+the same event. The cursor moves when a response is produced. A response that
+never reaches the model (connection lost, call cancelled) loses its
+intermediate events for that caller; `events.jsonl` keeps everything, and
+`watch_status` shows the last event. The final verdict is the exception: every
+later wait repeats it with `already_seen: true`, so it is delivered at least
+once.
 
 stdout carries the protocol only; diagnostics go to stderr.
 

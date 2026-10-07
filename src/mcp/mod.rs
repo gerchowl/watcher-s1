@@ -2,15 +2,21 @@
 //!
 //! The only async code in the crate lives here (a current-thread tokio
 //! runtime, built in [`serve`]); the wrapper itself stays synchronous. Runs
-//! are detached `watcher-s1 --pipe --events ...` processes whose state lives
-//! in the state directory ([`runs`]), so they outlive this server and any
-//! later server can wait on them. stdout is protocol only.
+//! are detached `watcher-s1 --pipe --events ... --control ...` processes
+//! whose state lives in the state directory ([`runs`]), so they outlive this
+//! server and any later server can wait on them. stdout is protocol only.
+//!
+//! Nothing here may block the runtime thread: every filesystem or socket
+//! operation runs on the blocking pool (`blocking`, with a wall-clock
+//! bound), so a ping is answered while a `watch_stop` or `watch_wait` is in
+//! progress. Whether a watcher lives, and stopping it, go through its
+//! control socket only.
 
 pub mod runs;
 
 use crate::GUIDE;
 use crate::event::rfc3339;
-use crate::follow::{Event, EventReader};
+use crate::follow::{Event, EventReader, ReadPos};
 use rmcp::{
     ErrorData as McpError, Peer, RoleServer, ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
@@ -23,7 +29,7 @@ use rmcp::{
     service::RequestContext,
     tool, tool_handler, tool_router,
 };
-use runs::{Dur, Meta, Phase, Runs, StartOpts};
+use runs::{Dur, Liveness, Meta, Phase, Runs, StartOpts, Stored, Take};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -43,12 +49,16 @@ const POLL: Duration = Duration::from_millis(100);
 const DEFAULT_WAIT_S: f64 = 60.0;
 /// Upper bound for one `watch_wait`; wait again for longer.
 const MAX_WAIT_S: f64 = 3600.0;
-/// Events returned by one `until: "next"`; the rest stay unseen for the next call.
-const MAX_BATCH: usize = 100;
-/// Grace between TERM to the watcher and SIGKILL to the job's group.
+/// Grace between TERM to the job's group and SIGKILL.
 const DEFAULT_GRACE_S: f64 = 5.0;
-/// How long to wait for the final event after the group SIGKILL.
+/// How long to wait for the final event after the grace is over.
 const KILL_SETTLE: Duration = Duration::from_secs(10);
+/// Wall-clock bound for one blocking operation on the state directory.
+const IO_BOUND: Duration = Duration::from_secs(15);
+/// How often completed runs are pruned while the server lives.
+const PRUNE_EVERY: Duration = Duration::from_secs(3600);
+/// Test hook: seconds between prunes, overriding [`PRUNE_EVERY`].
+const PRUNE_ENV: &str = "WATCHER_S1_MCP_PRUNE_SECS";
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct StartParams {
@@ -59,7 +69,8 @@ pub struct StartParams {
     pub cwd: Option<PathBuf>,
     /// Quiet time before `stalled`: seconds or "5m" (default 300s; 0 disables).
     pub silence: Option<Dur>,
-    /// Hard limit: seconds or "2h". The job's process group gets TERM, then KILL.
+    /// Hard limit: seconds or "2h". The job's process group gets TERM, then KILL. Without it nothing bounds the
+    /// run or its output.log (which grows as the job writes).
     pub timeout: Option<Dur>,
     /// Emit a `heartbeat` event this often (at least 1s). Heartbeats count as events for `until: "next"`; `final` skips them.
     pub heartbeat: Option<Dur>,
@@ -96,9 +107,10 @@ pub struct IdParams {
 pub struct StopParams {
     /// The run id from watch_start / watch_list.
     pub id: String,
-    /// Signal for the watcher, which forwards it to the job's process group: TERM (default), INT, HUP or QUIT.
+    /// Only TERM (the default) is accepted: the supervisor sends it to the job's process group and escalates to
+    /// SIGKILL by itself.
     pub signal: Option<String>,
-    /// Seconds to wait for the job to end before SIGKILL goes to its process group (default 5).
+    /// Seconds the job gets after TERM before its process group is SIGKILLed (default 5).
     pub grace_s: Option<f64>,
 }
 
@@ -123,6 +135,43 @@ fn event_json(e: &Event) -> Value {
         m.insert("seq".into(), json!(e.seq));
     }
     v
+}
+
+fn stored_json(s: &Stored) -> Value {
+    let mut v = s.event.clone();
+    if let Value::Object(m) = &mut v {
+        m.insert("seq".into(), json!(s.seq));
+    }
+    v
+}
+
+/// Run `f` on the blocking pool, bounded by `limit` of wall-clock time. The
+/// runtime thread never waits on the filesystem or a socket; a stuck
+/// operation costs a pool thread, not the server.
+async fn blocking<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
+    match tokio::time::timeout(limit, tokio::task::spawn_blocking(f)).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(format!("internal error: {e}")),
+        Err(_) => Err(format!(
+            "timed out after {limit:?}: the state directory or the watcher is not responding"
+        )),
+    }
+}
+
+/// Only TERM exists: the supervisor owns the escalation.
+fn check_signal(name: &str) -> Result<(), String> {
+    let bare = name.trim().to_ascii_uppercase();
+    match bare.strip_prefix("SIG").unwrap_or(&bare) {
+        "TERM" => Ok(()),
+        "KILL" => Err(
+            "never SIGKILL a run directly; watch_stop sends TERM and the supervisor escalates to SIGKILL on \
+                       the job's process group by itself"
+                .into(),
+        ),
+        other => Err(format!(
+            "unsupported signal {other:?}: watch_stop sends TERM (the only option)"
+        )),
+    }
 }
 
 fn is_heartbeat(e: &Event) -> bool {
@@ -160,206 +209,216 @@ pub struct Watcher {
 }
 
 impl Watcher {
-    pub fn new(runs: Runs, channel: bool) -> Self {
-        Watcher {
-            runs: Arc::new(runs),
-            channel,
-        }
+    pub fn new(runs: Arc<Runs>, channel: bool) -> Self {
+        Watcher { runs, channel }
     }
 
     /// Push each edge event of a run this server started, until it ends.
     fn spawn_channel(&self, peer: Peer<RoleServer>, meta: &Meta) {
-        let (id, path) = (meta.id.clone(), meta.events.clone());
-        let pid = meta.watcher_pid;
+        let (runs, meta) = (self.runs.clone(), meta.clone());
         tokio::spawn(async move {
-            let mut reader = EventReader::new(path);
+            let mut reader = Some(EventReader::resume(&meta.events, ReadPos::default()));
             loop {
-                let alive = runs::pid_alive(pid);
-                let batch = reader.poll().unwrap_or_default();
-                for e in batch.iter().filter(|e| is_edge(e)) {
-                    let n = ServerNotification::CustomNotification(channel_notification(&id, e));
+                let (r, id, rs) = (
+                    reader.take().expect("put back each round"),
+                    meta.id.clone(),
+                    runs.clone(),
+                );
+                let step = blocking(IO_BOUND, move || {
+                    let live = rs.probe(&id);
+                    let mut r = r;
+                    let polled = r.poll();
+                    (r, live, polled)
+                })
+                .await;
+                let Ok((r, live, polled)) = step else { return };
+                reader = Some(r);
+                let polled = polled.unwrap_or_default();
+                for e in polled.events.iter().filter(|e| is_edge(e)) {
+                    let n = ServerNotification::CustomNotification(channel_notification(&meta.id, e));
                     if let Err(err) = peer.send_notification(n).await {
-                        eprintln!("watcher-s1 mcp: channel push for {id} failed: {err}");
+                        eprintln!("watcher-s1 mcp: channel push for {} failed: {err}", meta.id);
                         return;
                     }
                 }
-                if reader.is_done() || (!alive && batch.is_empty()) {
+                let r = reader.as_ref().expect("just set");
+                if r.is_done() || (!live.alive() && polled.events.is_empty() && !polled.more) {
                     return;
                 }
-                sleep(POLL).await;
+                if polled.more {
+                    tokio::task::yield_now().await;
+                } else {
+                    sleep(POLL).await;
+                }
             }
         });
+    }
+
+    /// `meta.json` of a run, read on the blocking pool.
+    async fn meta(&self, id: &str) -> Result<Meta, String> {
+        let (runs, id) = (self.runs.clone(), id.to_owned());
+        blocking(IO_BOUND, move || runs.meta(&id)).await?
+    }
+
+    /// The run's phase: the final event decides, wherever it sits in the file.
+    async fn phase_of(&self, meta: &Meta, final_seen: bool, live: &Liveness) -> Phase {
+        let mut final_seen = final_seen;
+        if !final_seen && !live.alive() {
+            let (runs, m) = (self.runs.clone(), meta.clone());
+            final_seen = matches!(
+                blocking(IO_BOUND, move || runs.summary(&m)).await,
+                Ok(Ok(s)) if s.final_ev.is_some()
+            );
+        }
+        self.runs.phase(meta, final_seen, live)
     }
 
     /// Block (without spinning) until `until` is satisfied or `timeout`.
+    /// Each round is one cursor transaction on the blocking pool; the
+    /// deadline is checked between rounds, whatever the producer does.
     async fn wait(&self, meta: &Meta, until: &Until, timeout: Duration) -> Result<Value, String> {
         let deadline = Instant::now() + timeout;
-        let cursor = self.runs.cursor(&meta.id);
-        let mut reader = EventReader::new(&meta.events);
-        let mut seen: Vec<Event> = Vec::new();
+        let mode = match until {
+            Until::Next => Take::Next,
+            Until::Final => Take::Final,
+        };
         loop {
+            let (runs, m) = (self.runs.clone(), meta.clone());
             // Liveness before the read: a final event is written before the
-            // watcher exits, so "dead and no final" is never a race.
-            let alive = runs::pid_alive(meta.watcher_pid);
-            seen.extend(reader.poll().map_err(|e| format!("{}: {e}", meta.events.display()))?);
-            let pending: Vec<&Event> = seen.iter().filter(|e| e.seq > cursor).collect();
-            let final_ev = seen.iter().find(|e| e.is_final);
-            let ready = match until {
-                // A finished run has nothing more to say: answer with the verdict.
-                Until::Next => !pending.is_empty() || final_ev.is_some(),
-                Until::Final => final_ev.is_some(),
-            };
-            let lost = !alive && final_ev.is_none() && !ready;
-            let timed_out = Instant::now() >= deadline;
-            if ready || lost || timed_out {
-                return Ok(self.wait_result(meta, until, &seen, cursor, ready, lost));
+            // watcher exits, so "gone and no final" is never a race.
+            let (live, taken) = blocking(IO_BOUND, move || {
+                let live = runs.probe(&m.id);
+                (live, runs.take(&m, mode))
+            })
+            .await?;
+            let taken = taken?;
+            let phase = self.phase_of(meta, taken.final_seen, &live).await;
+            let lost = !taken.ready && !phase.live() && phase != Phase::Finished;
+            if taken.ready || lost || Instant::now() >= deadline {
+                return Ok(wait_reply(meta, &taken, phase, lost));
             }
-            sleep(POLL.min(deadline.saturating_duration_since(Instant::now()))).await;
+            if taken.more {
+                tokio::task::yield_now().await;
+            } else {
+                sleep(POLL.min(deadline.saturating_duration_since(Instant::now()))).await;
+            }
         }
     }
 
-    /// Build the reply and advance the caller's cursor past what it was given.
-    fn wait_result(&self, meta: &Meta, until: &Until, seen: &[Event], cursor: u64, ready: bool, lost: bool) -> Value {
-        let pending: Vec<&Event> = seen.iter().filter(|e| e.seq > cursor).collect();
-        let (mut out, skipped, upto): (Vec<&Event>, usize, u64) = match until {
-            Until::Next => {
-                let batch: Vec<&Event> = pending.into_iter().take(MAX_BATCH).collect();
-                let upto = batch.last().map_or(cursor, |e| e.seq);
-                (batch, 0, upto)
+    /// Ask the supervisor to stop the job (TERM, KILL after the grace, KILL
+    /// of the group again before the leader is reaped) and wait for the
+    /// final event.
+    async fn stop(&self, meta: &Meta, grace: Duration) -> Result<Value, String> {
+        let (runs, m) = (self.runs.clone(), meta.clone());
+        let (live, sum) = blocking(IO_BOUND, move || (runs.probe(&m.id), runs.summary(&m))).await?;
+        if sum?.final_ev.is_some() {
+            return Err(format!("run {} already finished", meta.id));
+        }
+        let phase = self.runs.phase(meta, false, &live);
+        if !phase.live() {
+            return Err(format!("run {}: the watcher process is gone", meta.id));
+        }
+        let (runs, id) = (self.runs.clone(), meta.id.clone());
+        blocking(IO_BOUND, move || runs.stop(&id, grace)).await??;
+        let began = Instant::now();
+        let deadline = began + grace + KILL_SETTLE;
+        let final_ev = loop {
+            let (runs, m) = (self.runs.clone(), meta.clone());
+            let (live, sum) = blocking(IO_BOUND, move || (runs.probe(&m.id), runs.summary(&m))).await?;
+            let fin = sum?.final_ev;
+            if fin.is_some() || !live.alive() || Instant::now() >= deadline {
+                break fin;
             }
-            // The final verdict is the point: edge events come with it, heartbeats are counted.
-            Until::Final if ready => {
-                let hb = pending.iter().filter(|e| is_heartbeat(e)).count();
-                let upto = pending.last().map_or(cursor, |e| e.seq);
-                (pending.into_iter().filter(|e| !is_heartbeat(e)).collect(), hb, upto)
-            }
-            Until::Final => (Vec::new(), 0, cursor),
+            sleep(POLL).await;
         };
-        let mut already_seen = false;
-        if out.is_empty()
-            && ready
-            && let Some(f) = seen.iter().find(|e| e.is_final)
-        {
-            // An earlier call handed the final event out already.
-            out.push(f);
-            already_seen = true;
-        }
-        self.runs.set_cursor(&meta.id, upto);
-        let phase = if seen.iter().any(|e| e.is_final) {
-            Phase::Finished
-        } else if lost {
-            Phase::Lost
-        } else {
-            Phase::Running
-        };
-        let mut v = json!({
-            "id": meta.id,
-            "state": phase,
-            "timed_out": !ready && !lost,
-            "events": out.iter().map(|e| event_json(e)).collect::<Vec<_>>(),
-            "lines": out.iter().map(|e| e.line.clone()).collect::<Vec<_>>(),
-        });
-        if skipped > 0 {
-            v["heartbeats_skipped"] = json!(skipped);
-        }
-        if already_seen {
-            v["already_seen"] = json!(true);
-        }
-        if lost {
-            v["note"] = json!("the watcher process is gone and wrote no final event (it was killed outright)");
-        }
-        v
-    }
-
-    async fn stop(&self, meta: &Meta, sig: nix::sys::signal::Signal, grace: Duration) -> Result<Value, String> {
-        let events = self.runs.events(meta).map_err(|e| e.to_string())?;
-        match self.runs.phase(meta, &events) {
-            Phase::Finished => return Err(format!("run {} already finished", meta.id)),
-            Phase::Lost => return Err(format!("run {}: the watcher process is gone", meta.id)),
-            Phase::Running => {}
-        }
-        // Resolve the group first: after a quick TERM exit there is nothing to ask.
-        let pgid = self.pgid(meta, events).await;
-        runs::signal_watcher(meta, sig)?;
-        let mut escalated = false;
-        if !self.ended_within(meta, grace).await {
-            let pgid = pgid.ok_or("the job did not end and its process group is unknown; not escalating")?;
-            runs::kill_job_group(pgid)?;
-            escalated = true;
-            self.ended_within(meta, KILL_SETTLE).await;
-        }
-        let events = self.runs.events(meta).map_err(|e| e.to_string())?;
-        let last = events.iter().find(|e| e.is_final);
         Ok(json!({
             "id": meta.id,
-            "signal": format!("{sig:?}"),
-            "escalated_to_sigkill": escalated,
-            "pgid": pgid,
-            "ended": last.is_some(),
-            "final": last.map(event_json),
-            "line": last.map(|e| e.line.clone()),
+            "signal": "TERM",
+            "escalated_to_sigkill": final_ev.as_ref().is_some_and(|f| f.event["exit"]["signal"] == 9),
+            "pid": live_field(&live, "pid"),
+            "pgid": live_field(&live, "pgid"),
+            "ended": final_ev.is_some(),
+            "waited_ms": began.elapsed().as_millis() as u64,
+            "final": final_ev.as_ref().map(stored_json),
+            "line": final_ev.as_ref().map(|f| f.line.clone()),
         }))
     }
+}
 
-    /// The job's process group; a job that was only just spawned has no
-    /// event and no child yet, so look for a moment.
-    async fn pgid(&self, meta: &Meta, mut events: Vec<Event>) -> Option<i32> {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if let Some(p) = runs::job_pgid(meta, &events) {
-                return Some(p);
-            }
-            if Instant::now() >= deadline || events.iter().any(|e| e.is_final) {
-                return None;
-            }
-            sleep(POLL).await;
-            events = self.runs.events(meta).unwrap_or_default();
-        }
+fn live_field(live: &Liveness, key: &str) -> Value {
+    match live {
+        Liveness::Alive(v) => v[key].clone(),
+        Liveness::Gone => Value::Null,
     }
+}
 
-    /// Has the run's final event arrived (or its watcher died) within `d`?
-    async fn ended_within(&self, meta: &Meta, d: Duration) -> bool {
-        let deadline = Instant::now() + d;
-        loop {
-            let alive = runs::pid_alive(meta.watcher_pid);
-            let events = self.runs.events(meta).unwrap_or_default();
-            if events.iter().any(|e| e.is_final) {
-                return true;
-            }
-            if !alive || Instant::now() >= deadline {
-                return !alive;
-            }
-            sleep(POLL).await;
-        }
+/// The reply of `watch_wait`.
+fn wait_reply(meta: &Meta, t: &runs::Taken, phase: Phase, lost: bool) -> Value {
+    let mut v = json!({
+        "id": meta.id,
+        "state": phase,
+        "timed_out": !t.ready && !lost,
+        "events": t.events.iter().map(event_json).collect::<Vec<_>>(),
+        "lines": t.events.iter().map(|e| e.line.clone()).collect::<Vec<_>>(),
+    });
+    if t.heartbeats_skipped > 0 {
+        v["heartbeats_skipped"] = json!(t.heartbeats_skipped);
     }
+    if t.already_seen {
+        v["already_seen"] = json!(true);
+    }
+    if t.more {
+        v["more"] = json!(true);
+    }
+    if lost {
+        v["note"] = json!(match phase {
+            Phase::Failed => "the watcher could not be started (see watch_status)",
+            _ => "the watcher process is gone and wrote no final event (it was killed outright)",
+        });
+    }
+    v
+}
 
-    fn summary(&self, meta: &Meta) -> Value {
-        let events = self.runs.events(meta).unwrap_or_default();
-        let phase = self.runs.phase(meta, &events);
-        let last = events.last();
-        let final_ev = events.iter().find(|e| e.is_final);
-        let end_ms = match phase {
-            Phase::Running => runs::now_ms(),
-            _ => self.runs.last_write_ms(meta).unwrap_or_else(runs::now_ms),
-        };
-        json!({
-            "id": meta.id,
-            "cmd": meta.cmd,
-            "cwd": meta.cwd,
-            "started": meta.started,
-            "state": phase,
-            "alive": runs::pid_alive(meta.watcher_pid),
-            "watcher_pid": meta.watcher_pid,
-            "elapsed_s": end_ms.saturating_sub(meta.started_ms) as f64 / 1000.0,
-            "event_state": last.map(|e| e.event["state"].clone()),
-            "exit": final_ev.map(|e| e.event["exit"].clone()),
-            "events": events.len(),
-            "last_event": last.map(event_json),
-            "line": last.map(|e| e.line.clone()),
-            "events_path": meta.events,
-            "log_path": meta.log,
-        })
+/// `watch_status` / `watch_list` row. Blocking: call on the pool.
+fn describe(runs: &Runs, meta: &Meta) -> Value {
+    let live = runs.probe(&meta.id);
+    let (sum, err) = match runs.summary(meta) {
+        Ok(s) => (s, None),
+        Err(e) => (runs::Summary::default(), Some(e)),
+    };
+    let phase = runs.phase(meta, sum.final_ev.is_some(), &live);
+    let end_ms = if phase.live() {
+        runs::now_ms()
+    } else {
+        runs.last_write_ms(meta).unwrap_or_else(runs::now_ms)
+    };
+    let last = sum.last.as_ref();
+    let mut v = json!({
+        "id": meta.id,
+        "cmd": meta.cmd,
+        "cwd": meta.cwd,
+        "started": meta.started,
+        "state": phase,
+        "alive": live.alive(),
+        "watcher_pid": meta.watcher_pid,
+        "job_pid": live_field(&live, "pid"),
+        "job_pgid": live_field(&live, "pgid"),
+        "elapsed_s": end_ms.saturating_sub(meta.started_ms) as f64 / 1000.0,
+        "event_state": last.map(|e| e.event["state"].clone()),
+        "exit": sum.final_ev.as_ref().map(|e| e.event["exit"].clone()),
+        "events": sum.events,
+        "last_event": last.map(stored_json),
+        "line": last.map(|e| e.line.clone()),
+        "events_path": meta.events,
+        "log_path": meta.log,
+    });
+    if sum.partial {
+        v["partial"] = json!(true);
     }
+    if let Some(e) = err.or_else(|| meta.error.clone()) {
+        v["error"] = json!(e);
+    }
+    v
 }
 
 #[tool_router]
@@ -380,7 +439,11 @@ impl Watcher {
             heartbeat: p.heartbeat,
             s1: p.s1,
         };
-        Ok(match self.runs.start(&opts) {
+        let runs = self.runs.clone();
+        let started = blocking(Duration::from_secs(30), move || runs.start(&opts))
+            .await
+            .and_then(|r| r);
+        Ok(match started {
             Ok(meta) => {
                 if self.channel {
                     self.spawn_channel(peer, &meta);
@@ -392,6 +455,7 @@ impl Watcher {
                     "watcher_pid": meta.watcher_pid,
                     "started": meta.started,
                     "cmd": meta.cmd,
+                    "state": "running",
                 }))
             }
             Err(e) => fail(e),
@@ -406,7 +470,7 @@ impl Watcher {
         if !secs.is_finite() || secs < 0.0 {
             return Ok(fail("timeout_s must be a non-negative number"));
         }
-        let meta = match self.runs.meta(&p.id) {
+        let meta = match self.meta(&p.id).await {
             Ok(m) => m,
             Err(e) => return Ok(fail(e)),
         };
@@ -419,33 +483,34 @@ impl Watcher {
 
     #[tool(description = "The last event of a run, how long it has run, and whether its watcher process is alive.")]
     async fn watch_status(&self, Parameters(p): Parameters<IdParams>) -> Result<CallToolResult, McpError> {
-        Ok(match self.runs.meta(&p.id) {
-            Ok(meta) => reply(self.summary(&meta)),
+        let meta = match self.meta(&p.id).await {
+            Ok(m) => m,
+            Err(e) => return Ok(fail(e)),
+        };
+        let runs = self.runs.clone();
+        Ok(match blocking(IO_BOUND, move || describe(&runs, &meta)).await {
+            Ok(v) => reply(v),
             Err(e) => fail(e),
         })
     }
 
     #[tool(
-        description = "Stop a run: TERM (or signal) goes to the watcher, which forwards it to the job's process group; if the job has not ended after grace_s (default 5), the job's process group gets SIGKILL and the watcher reports the signal exit. Never kills the watcher itself."
+        description = "Stop a run: its supervisor sends TERM to the job's whole process group, SIGKILLs the group after grace_s (default 5) and again before it reaps the leader, so descendants that ignore TERM die too; the final event has reason stopped and the real signal exit. Talks to the supervisor over its control socket; never signals a pid."
     )]
     async fn watch_stop(&self, Parameters(p): Parameters<StopParams>) -> Result<CallToolResult, McpError> {
-        let sig = match runs::parse_signal(p.signal.as_deref().unwrap_or("TERM")) {
-            Ok(s) => s,
-            Err(e) => return Ok(fail(e)),
-        };
+        if let Err(e) = check_signal(p.signal.as_deref().unwrap_or("TERM")) {
+            return Ok(fail(e));
+        }
         let grace = p.grace_s.unwrap_or(DEFAULT_GRACE_S);
         if !grace.is_finite() || grace < 0.0 {
             return Ok(fail("grace_s must be a non-negative number"));
         }
-        let meta = match self.runs.meta(&p.id) {
+        let meta = match self.meta(&p.id).await {
             Ok(m) => m,
             Err(e) => return Ok(fail(e)),
         };
         Ok(
-            match self
-                .stop(&meta, sig, Duration::from_secs_f64(grace.min(MAX_WAIT_S)))
-                .await
-            {
+            match self.stop(&meta, Duration::from_secs_f64(grace.min(MAX_WAIT_S))).await {
                 Ok(v) => reply(v),
                 Err(e) => fail(e),
             },
@@ -455,8 +520,21 @@ impl Watcher {
     #[tool(description = "Runs in the state directory, newest first, with their state (running, finished, lost).")]
     async fn watch_list(&self, Parameters(p): Parameters<ListParams>) -> Result<CallToolResult, McpError> {
         let limit = p.limit.unwrap_or(50);
-        let all: Vec<Value> = self.runs.list().iter().take(limit).map(|m| self.summary(m)).collect();
-        Ok(reply(json!({"runs": all})))
+        let runs = self.runs.clone();
+        Ok(
+            match blocking(IO_BOUND * 4, move || {
+                runs.list()
+                    .iter()
+                    .take(limit)
+                    .map(|m| describe(&runs, m))
+                    .collect::<Vec<_>>()
+            })
+            .await
+            {
+                Ok(all) => reply(json!({"runs": all})),
+                Err(e) => fail(e),
+            },
+        )
     }
 }
 
@@ -530,6 +608,7 @@ pub fn serve(state_dir: PathBuf, channel: bool) -> i32 {
             return 1;
         }
     };
+    let runs = Arc::new(runs);
     let pruned = runs.prune(runs::MAX_AGE);
     eprintln!(
         "watcher-s1 mcp: serving on stdio (state dir {}, channel {}, pruned {pruned} old run(s), {})",
@@ -545,6 +624,25 @@ pub fn serve(state_dir: PathBuf, channel: bool) -> i32 {
         }
     };
     rt.block_on(async move {
+        // Completed runs are pruned for as long as the server lives (never a
+        // run whose watcher still answers).
+        let pruner = runs.clone();
+        let every = std::env::var(PRUNE_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .map_or(PRUNE_EVERY, Duration::from_secs);
+        tokio::spawn(async move {
+            loop {
+                sleep(every).await;
+                let r = pruner.clone();
+                match blocking(IO_BOUND * 8, move || r.prune(runs::MAX_AGE)).await {
+                    Ok(n) if n > 0 => eprintln!("watcher-s1 mcp: pruned {n} old run(s)"),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("watcher-s1 mcp: prune: {e}"),
+                }
+            }
+        });
         let service = match Watcher::new(runs, channel).serve(rmcp::transport::stdio()).await {
             Ok(s) => s,
             Err(e) => {

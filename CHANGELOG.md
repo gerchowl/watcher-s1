@@ -20,12 +20,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `watch_stop` no longer signals processes: the supervisor owns a private control socket (hidden `--control PATH`: line-delimited JSON, `status` and `stop`) and performs the stop itself, with the same TERM, grace, KILL escalation as `--timeout`, including a group SIGKILL before it reaps the leader. The new final reason `stopped` (schema 1 enum) marks it; `watch_stop` loses its `signal` option (TERM only). Liveness in `watch_status`/`watch_wait` comes from that socket, never from a pid ([#26](https://github.com/gerchowl/watcher-s1/issues/26))
+- `watch_wait` returns at most 100 events and 256 KiB per call (`more: true` when there is more), reads incrementally from a persisted byte offset, and is documented as delivering each intermediate event once per run (the final verdict repeats with `already_seen`); runs are pruned hourly while the server lives, and `output.log` is documented as unbounded unless a `timeout` is set ([#26](https://github.com/gerchowl/watcher-s1/issues/26))
+
 ### Deprecated
 
 ### Removed
 
 ### Fixed
 
+- MCP: `watch_stop` could TERM an unrelated process (a reused or forged `watcher_pid`) or SIGKILL a group named by an event; it now talks only to the run's control socket ([#26](https://github.com/gerchowl/watcher-s1/issues/26))
+- MCP: a forged `meta.json` (`../` or absolute id) could redirect the cursor write outside `runs/`; the directory-entry id is now authoritative, paths derive from the run directory, state files are opened `O_NOFOLLOW`, must be regular files and are size-bounded, and cursor writes are atomic ([#26](https://github.com/gerchowl/watcher-s1/issues/26))
+- MCP: a stopped job's descendants that ignore TERM no longer survive `watch_stop` when the leader dies first ([#26](https://github.com/gerchowl/watcher-s1/issues/26))
+- MCP: blocking filesystem and socket work (a FIFO `meta.json`, a hung probe) no longer freezes the server: it runs on the blocking pool with wall-clock bounds, and `ps` is gone ([#26](https://github.com/gerchowl/watcher-s1/issues/26))
+- Event reading is bounded: lines over 1 MiB are discarded (one warning), a poll reads at most 4 MiB before yielding, the follower's parent map holds 4096 run ids, and the MCP server no longer rereads or accumulates a run's history ([#26](https://github.com/gerchowl/watcher-s1/issues/26))
+- MCP: overlapping `watch_wait` calls, in one server or several, no longer get the same event or move the cursor backwards (per-run `flock` transactions; persistence errors are reported) ([#26](https://github.com/gerchowl/watcher-s1/issues/26))
+- MCP: `watch_start` records the run (`starting`) before launching the watcher and marks it `failed` if the launch fails, so no detached command is left untracked ([#26](https://github.com/gerchowl/watcher-s1/issues/26))
+- `follow` checks the pathname for rotation every 500 ms even while an old file keeps being written, so the final event on the new file is no longer starved; it keeps at most 16 old files ([#26](https://github.com/gerchowl/watcher-s1/issues/26))
+- Documented the state directory precedence (`WATCHER_S1_STATE_DIR` first) and that pruning keeps runs whose watcher is alive ([#26](https://github.com/gerchowl/watcher-s1/issues/26))
 - Event delivery no longer runs on the supervisor loop: a writer thread with a bounded queue keeps `--timeout`, signal forwarding and heartbeats responsive when the event sink (`--events-fd` pipe, stderr) is not read; heartbeats are shed under overload and report `heartbeats_dropped`, other events keep order via a bounded overflow queue. The final event may still block at exit on a sink nobody reads.
 - `--heartbeat-s1` keeps at most one System One request in flight: after an overdue verdict, later heartbeats go out with `s1: null` and no new request starts until the slow one returns.
 - No supervisor diagnostic or event write can block the loop any more: every `watcher-s1 (log):` line (and the overflow warning) goes through a bounded, nonblocking channel to one stderr writer thread shared with the stderr event sink (a full queue drops and counts), and a timeout sends TERM before it logs, so a stderr nobody reads no longer freezes `--timeout` ([#26](https://github.com/gerchowl/watcher-s1/issues/26))
