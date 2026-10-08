@@ -1,19 +1,19 @@
 ---
 type: issue
-state: open
+state: closed
 created: 2026-10-07T13:27:03Z
-updated: 2026-10-07T14:24:15Z
+updated: 2026-10-07T16:05:10Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/gerchowl/watcher-s1/issues/28
-comments: 1
+comments: 2
 labels: none
 assignees: none
 milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-10-07T15:05:49.236Z
+synced: 2026-10-08T08:43:13.024Z
 ---
 
 # [Issue 28]: [tests/wrap.rs: a_grandchild_writing_forever_does_not_keep_us_alive can spin for minutes under heavy CPU contention](https://github.com/gerchowl/watcher-s1/issues/28)
@@ -28,4 +28,12 @@ Worth confirming whether it is only a test-timing issue or a real drain-loop liv
 _Posted on October 7, 2026 at 02:24 PM_
 
 Root cause found: not just test timing. The supervisor's output loop read without a per-pass limit while data kept arriving, so a fast writer (`yes &`) starved the exit check, the timers, `--timeout` and the control socket (the drain cap only applies after the leader's exit is noticed). Fixed in #29 (d4793c5): at most 16 reads per output per pass.
+
+---
+
+# [Comment #2]() by [gerchowl]()
+
+_Posted on October 7, 2026 at 04:05 PM_
+
+Root cause (unbounded reads per pass starving the loop) fixed in #29; shipped in v0.2.0.
 

@@ -1,19 +1,19 @@
 ---
 type: issue
-state: open
+state: closed
 created: 2026-10-07T10:33:32Z
-updated: 2026-10-07T11:15:42Z
+updated: 2026-10-07T16:05:05Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/gerchowl/watcher-s1/issues/20
-comments: 1
+comments: 2
 labels: none
 assignees: none
 milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-10-07T15:05:50.027Z
+synced: 2026-10-08T08:43:13.616Z
 ---
 
 # [Issue 20]: [feat: watcher-s1 mcp — MCP server (start/wait/status/stop runs, guide resource, Channels push)](https://github.com/gerchowl/watcher-s1/issues/20)
@@ -75,4 +75,12 @@ _Posted on October 7, 2026 at 11:15 AM_
 - **Build:** the official `rmcp` crate, behind an `mcp` cargo feature that is **on by default**, so release binaries and the nix package include it; `--no-default-features` builds without it. Version pinned via `Cargo.lock` and tracked by Renovate's cargo manager, like every other dependency.
 - **Ships in 0.2.0** together with #18 and #19.
 - **Order:** implementation starts once #21 (heartbeat) and #22 (guide/follow) are merged, because it reuses `follow`'s event parsing and the compiled-in guide.
+
+---
+
+# [Comment #2]() by [gerchowl]()
+
+_Posted on October 7, 2026 at 04:05 PM_
+
+Shipped in v0.2.0 (#25, hardened in #29).
 
