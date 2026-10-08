@@ -1,19 +1,19 @@
 ---
 type: issue
-state: open
+state: closed
 created: 2026-10-07T12:54:39Z
-updated: 2026-10-07T12:54:39Z
+updated: 2026-10-07T16:05:07Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/gerchowl/watcher-s1/issues/26
-comments: 0
+comments: 1
 labels: none
 assignees: none
 milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-10-07T15:05:49.639Z
+synced: 2026-10-08T08:43:13.311Z
 ---
 
 # [Issue 26]: [0.2.0 release review: MCP stop/state safety, non-blocking diagnostics, resource bounds](https://github.com/gerchowl/watcher-s1/issues/26)
@@ -241,4 +241,12 @@ Additional acceptance/surface checks:
 VERDICT: CHANGES
 
 </details>
+
+---
+
+# [Comment #1]() by [gerchowl]()
+
+_Posted on October 7, 2026 at 04:05 PM_
+
+All findings addressed in #27 and #29 (S5's per-run output cap documented instead); shipped in v0.2.0.
 
