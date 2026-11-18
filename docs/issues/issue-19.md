@@ -2,7 +2,7 @@
 type: issue
 state: closed
 created: 2026-10-07T10:27:59Z
-updated: 2026-10-07T12:08:24Z
+updated: 2026-11-17T21:18:36Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/gerchowl/watcher-s1/issues/19
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-10-07T15:05:50.496Z
+synced: 2026-11-18T09:59:11.029Z
 ---
 
 # [Issue 19]: [feat: watcher-s1 guide + follow — the binary is the single source for agent usage](https://github.com/gerchowl/watcher-s1/issues/19)

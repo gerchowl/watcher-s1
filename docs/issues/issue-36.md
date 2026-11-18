@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-10-08T14:27:33Z
-updated: 2026-10-08T14:27:33Z
+updated: 2026-11-17T21:18:12Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/gerchowl/watcher-s1/issues/36
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-10-09T08:48:29.213Z
+synced: 2026-11-18T09:59:08.951Z
 ---
 
 # [Issue 36]: [System One switches from Kev-4B to Clef ([fleet-config-repo]#330): re-run the question eval](https://github.com/gerchowl/watcher-s1/issues/36)

@@ -3,7 +3,7 @@ type: pull_request
 state: closed (merged)
 branch: feat/v1-wrapper → main
 created: 2026-10-05T13:42:10Z
-updated: 2026-10-05T14:13:07Z
+updated: 2026-11-17T21:18:33Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/gerchowl/watcher-s1/pull/1
@@ -13,7 +13,7 @@ assignees: none
 milestone: none
 projects: none
 merged: 2026-10-05T14:13:04Z
-synced: 2026-10-06T15:23:47.059Z
+synced: 2026-11-18T09:59:14.164Z
 ---
 
 # [PR 1](https://github.com/gerchowl/watcher-s1/pull/1) feat: watcher-s1 v1, a truthful wrapper with tier 0-2 detection

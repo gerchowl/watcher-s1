@@ -2,7 +2,7 @@
 type: issue
 state: closed
 created: 2026-10-07T10:33:32Z
-updated: 2026-10-07T16:05:05Z
+updated: 2026-11-17T21:18:22Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/gerchowl/watcher-s1/issues/20
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-10-08T08:43:13.616Z
+synced: 2026-11-18T09:59:10.510Z
 ---
 
 # [Issue 20]: [feat: watcher-s1 mcp — MCP server (start/wait/status/stop runs, guide resource, Channels push)](https://github.com/gerchowl/watcher-s1/issues/20)

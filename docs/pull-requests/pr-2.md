@@ -3,7 +3,7 @@ type: pull_request
 state: closed (merged)
 branch: feat/posttooluse-judge → main
 created: 2026-10-05T14:13:54Z
-updated: 2026-10-05T14:20:21Z
+updated: 2026-11-17T21:18:30Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/gerchowl/watcher-s1/pull/2
@@ -13,7 +13,7 @@ assignees: none
 milestone: none
 projects: none
 merged: 2026-10-05T14:20:19Z
-synced: 2026-10-06T15:23:45.615Z
+synced: 2026-11-18T09:59:15.687Z
 ---
 
 # [PR 2](https://github.com/gerchowl/watcher-s1/pull/2) feat: judge --posttooluse, a Claude Code hook for masked pipes

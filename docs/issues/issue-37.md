@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-10-08T18:46:26Z
-updated: 2026-10-08T18:46:26Z
+updated: 2026-11-17T21:18:09Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/gerchowl/watcher-s1/issues/37
@@ -13,7 +13,7 @@ milestone: Supervision correctness
 projects: none
 parent: none
 children: none
-synced: 2026-10-09T08:48:28.899Z
+synced: 2026-11-18T09:59:08.584Z
 ---
 
 # [Issue 37]: [Expected negative gate fixture classified as masked_failure despite asserted rejection](https://github.com/gerchowl/watcher-s1/issues/37)

@@ -2,7 +2,7 @@
 type: issue
 state: closed
 created: 2026-10-07T12:54:39Z
-updated: 2026-10-07T16:05:07Z
+updated: 2026-11-17T21:18:18Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/gerchowl/watcher-s1/issues/26
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-10-08T08:43:13.311Z
+synced: 2026-11-18T09:59:09.729Z
 ---
 
 # [Issue 26]: [0.2.0 release review: MCP stop/state safety, non-blocking diagnostics, resource bounds](https://github.com/gerchowl/watcher-s1/issues/26)

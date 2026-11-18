@@ -2,7 +2,7 @@
 type: issue
 state: open
 created: 2026-11-02T08:25:58Z
-updated: 2026-11-02T08:25:58Z
+updated: 2026-11-17T21:18:07Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/gerchowl/watcher-s1/issues/39
@@ -13,7 +13,7 @@ milestone: none
 projects: none
 parent: none
 children: none
-synced: 2026-11-02T09:12:19.445Z
+synced: 2026-11-18T09:59:08.150Z
 ---
 
 # [Issue 39]: ["System One unavailable, failing open … timeout" during a CI watch on a loaded host](https://github.com/gerchowl/watcher-s1/issues/39)
